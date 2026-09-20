@@ -10,20 +10,88 @@
 
 ## 0. 结论速览
 
-| 目标 | 可行性 | 核心工作 | 难度 |
-| --- | --- | --- | --- |
-| Windows 桌面 | ✅ 已实现 | — | — |
-| Linux 桌面 | ✅ 可行 | 打包链 + 平台专属 API 替换 | 中 |
-| macOS 桌面 | ✅ 可行 | 打包 + 签名公证 + 平台专属 API | 中～大 |
-| 手机 APP（iOS/Android） | 🔶 **换架构可行** | 端侧 UI 重做，大脑放服务端或随包 | 中 |
+| 目标 | 可行性 | 当前实际状态 | 核心工作 | 难度 |
+| --- | --- | --- | --- | --- |
+| Windows 桌面 | ✅ 已实现 | 47 个 Gitee Release 全是它的 | — | — |
+| Linux 桌面 | ✅ 可行 | **产物 0 个**；代码 93% 就绪，1 个文件硬拦启动 | 解硬拦 + 打包链 | 中 |
+| macOS 桌面 | ✅ 可行 | **产物 0 个**；同上，另需签名公证 | 解硬拦 + 打包 + 签名公证 | 中～大 |
+| 手机 APP（iOS/Android） | 🔶 **换架构可行** | 未启动（按你的决定暂缓） | 端侧 UI 重做，大脑放服务端或随包 | 中 |
 | 手机"套壳"（WebView） | ✅ 最快 | 现有 Web 能力 + 壳 | 小 |
 
 关键认知：**pasm-qclaw 是"界面 + 大脑"合一的桌面程序。跨到手机时，把这两半拆开，
 一半留桌面、一半上云 —— 这不是妥协，而是唯一正确的架构。**
 
+> Linux / macOS 版**不是"没做好"，而是"从未构建"** ——
+> 详见 §1.0 的实测核查与 §1.0.1 的代码就绪度数据。
+
 ---
 
 ## 1. 桌面端跨平台（Windows → Linux / macOS）
+
+### 1.0 现状核查：为什么你在发行版里找不到 Linux / macOS 版
+
+**结论：它们从来没被构建过 —— 不是"发布了但你没找到"，而是"根本没有"。**
+实测核查（2026-09-20，直接查两端 Release API）：
+
+| 核查项 | 实测结果 |
+| --- | --- |
+| Gitee Release 总数 | **47** 条 |
+| GitHub Release 总数 | **48** 条 |
+| 带附件的 Release | **各端只有 1 条**（即最新版 v0.31.0）—— 其余是纯记录 |
+| 附件实际后缀分布 | Gitee `{exe:1, bin:3}`、GitHub `{exe:1}`，**全部 Windows** |
+| 非 Windows 安装包（`deb/rpm/dmg/AppImage/pkg/apk`） | **0 个** |
+| `latest.json` 升级通道 | 只描述 Windows 安装包 |
+| 打包脚本 | 只有 `desktop/installer.iss`（Inno Setup，**Windows 专用**）+ `desktop/build_windows.bat` |
+| CI 配置 | 无（不存在跨平台构建流水线） |
+
+> 附带发现：按你既定的"**只保留最新版安装包**"维护惯例，旧版 Release 的附件已被清理，
+> 所以现在**能下载的只有 v0.31.0 一个版本**（那 3 个 `.bin` 是 Inno DiskSpanning 的切片）。
+> 这是预期行为，不是丢失 —— 但如果有人想下历史版本，是下不到的。
+
+原因很直接：**PyInstaller 不支持交叉编译** —— 在 Windows 上打不出 Linux/macOS 的包。
+要出这两个平台的产物，必须在各自的操作系统上（或 CI 的对应 runner 上）各跑一次构建。
+目前项目没有任何这样的构建机或 CI，所以产物自然不存在。
+
+### 1.0.1 代码就绪度实测：其实比想象中好得多
+
+对 `desktop/` 全部 **94 个 .py 模块**做了 AST 级扫描（区分"导入期"与"函数内"，
+因为只有导入期执行才会让应用**启动即崩**）：
+
+| 分档 | 模块数 | 占比 | 含义 |
+| --- | --- | --- | --- |
+| 完全无 Windows 依赖 | **87** | **93%** | 直接跨平台可用 |
+| 仅函数内用到（可降级） | 6 | 6% | 不崩，但该功能不可用 |
+| **导入期硬拦（启动即崩）** | **1** | **1%** | 必须先改 |
+
+**唯一的启动硬拦是 `desktop/audio.py`**：
+
+```python
+# audio.py 模块顶层（第 14、18 行）—— 导入期即执行
+import winreg                              # ← Linux/macOS 无此模块 → ImportError
+_ole32 = ctypes.OleDLL("ole32")            # ← POSIX 无 OleDLL 符号 → AttributeError
+```
+
+而 `pasm_companion.py:59` **在模块顶层** `import audio as audio_mod`，
+所以整条启动链（实测 35 个模块）会在这里断掉 —— **应用连窗口都出不来**。
+
+已用两种独立方式证实（可复现）：
+- **静态**：AST 确认 `import winreg` 与 `ctypes.OleDLL` 位于模块顶层，不在函数内；
+- **动态**：屏蔽 `winreg` 并摘掉 `ctypes.OleDLL` 后 `import audio` → 实测抛
+  `AttributeError: module 'ctypes' has no attribute 'OleDLL'`。
+
+> 修法很小（把两个顶层语句包进 `if os.name == "nt":` 并在非 Windows 下给空实现），
+> 但**改了它只是"能启动"**，不等于"能用"。
+
+启动链上的另外 6 个可降级模块（函数级用到 Windows API）：
+
+| 模块 | Windows 用法 | 现状 |
+| --- | --- | --- |
+| `tts.py` | `ctypes.windll.winmm` / `winsound`（MCI 播放） | 播放/暂停处已有 `os.name == "nt"` 守卫 → **优雅降级**；但 `_mci_play` / `play_system_sound` 无守卫 |
+| `autostart.py` | `winreg` 写 HKCU Run 键 | `import winreg` 在函数内 + `is_supported()` → **已经是跨平台范例，可照抄** |
+| `asr.py` | `winsound`（提示音）/ `winreg`（检测语音引擎） | 无守卫，调用才炸 |
+| `sysops.py` | `ctypes.windll`（回收站 / 桌面路径） | `desktop_dir()` 有守卫，`to_recycle_bin()` 无 |
+| `logsetup.py` | `ctypes.windll.shell32` 取 APPDATA | 已在 `try/except` 内 → 会退回 `~` |
+| `pasm_main.py` | `ctypes.windll.user32.MessageBoxW` 兜底弹窗 | 已在 `try/except` 内 |
 
 ### 1.1 技术栈本身是跨平台的 ✅
 
@@ -39,10 +107,12 @@ pasm-qclaw 技术底座是 **PySide6（Qt 6）+ PyInstaller**，两者都官方�
 
 所以**核心逻辑不需要重写** —— 但下面这些"Windows 专属调用"必须逐个替换。
 
-### 1.2 必须改的 Windows 专属点（核对清单）
+### 1.2 必须改的 Windows 专属点（通用核对清单）
 
-> 请以实际 `desktop/` 源码为准逐项 grep 核对；下表是按常见 Windows 桌面程序的形态列的，
-> 每一项都属于"不换就会在 Linux/macOS 直接抛异常"的类型。
+> **§1.0.1 是实测结果，本表是通用参考。** 两者冲突时以 §1.0.1 为准 ——
+> 本表按"常见 Windows 桌面程序的形态"列全，用于**对照检查有没有漏项**
+> （例如某个能力当前没被用到、但以后加了会踩坑）。
+> 每一项都属于"不换就会在 Linux/macOS 抛异常或行为不对"的类型。
 
 | 位置/能力 | Windows 现状 | 跨平台替代 |
 | --- | --- | --- |
@@ -80,17 +150,25 @@ Linux 机器（或 Docker/CI）各跑一次。**这是跨平台成本的大头�
 macOS 公证需要 **Apple Developer 账号（每年 $99）+ 构建机上配置证书**，
 且公证是**联网提交 + 审核**（通常几分钟）。这是 macOS 支持里最"流程性"的一步。
 
-### 1.5 桌面端工作量与风险
+### 1.5 桌面端工作量与风险（按实测数据修订）
+
+代码侧只剩 **1 个文件**是启动硬拦、**6 个文件**是功能降级 —— 所以成本大头
+**不在写代码，而在"构建 + 签名 + 分发"这三件事**：
 
 | 项目 | 工作量 | 风险 | 说明 |
 | --- | --- | --- | --- |
-| Linux 适配 + 打包 | 中（3–5 天量级） | 低 | 主要是平台 API 替换与 AppImage 脚本；GNOME 托盘是唯一"可能不显示"的坑 |
-| macOS 适配 + 打包 | 中～大 | 中 | 适配同上；额外要过签名公证；Retina/字体需实测 |
-| CI 三平台构建 | 中 | 低 | GitHub Actions 有 windows/macos/ubuntu runner，天然适合 |
-| 自动更新三平台 | 中 | 中 | Inno 只服务 Windows，另两平台要各做一套 |
+| 解除启动硬拦 | **小** | 低 | 只有 `audio.py`：把两个顶层语句包进平台判断，非 Windows 给空实现。改完应用能启动 |
+| 打磨 6 个降级模块 | 小～中 | 低 | 照抄 `autostart.py` 已有的写法（函数内 import + `is_supported()`），逐项给替代实现 |
+| Linux 打包 | 中 | 低 | PyInstaller + AppImage 脚本；GNOME 托盘是唯一"可能不显示"的坑 |
+| macOS 打包 | 中 | 中 | 同上，额外要过签名 + 公证 |
+| **CI 三平台构建** | 中 | 低 | GitHub Actions 有 windows/macos/ubuntu runner，天然适合；**这是绕开"必须有 mac 机器"的正解** |
+| 自动更新三平台 | 中 | 中 | Inno 只服务 Windows，另两平台要各做一套（`latest.json` 可扩展） |
 | ffmpeg/TTS 三平台下载源 | 小 | 低 | 现有 npmmirror 静态包按平台换文件名即可 |
 
 **建议顺序**：先 Linux（成本最低、验证"平台解耦"是否彻底）→ 再 macOS（补签名流程）。
+
+> ⚠️ **不要指望"在 Windows 上打出三平台包"**。PyInstaller 不能交叉编译，
+> 必须各平台各构建一次。没有 mac 机器时，CI 的 macOS runner 是唯一出路。
 
 ---
 
@@ -183,10 +261,20 @@ iOS / Android APP (Flutter 或原生)
 
 ## 5. 一句话回答你的问题
 
-> **桌面：Linux 与 macOS 都能做**，pasm-qclaw 的 PySide6 底座本身跨平台，
-> 真正的工作量在"替换 Windows 专属调用 + 三平台各自打包签名"，不在重写功能。
+> **你在发行版里找不到 Linux / macOS 版，是因为它们从未被构建过** ——
+> 仓库里 95 个 Release（Gitee 47 + GitHub 48）**各端只有 1 条带附件**，
+> 附件后缀只有 `.exe`（+3 个 `.bin` 切片），**非 Windows 的安装包为 0 个**；
+> 打包脚本也只有 Windows 专用的 Inno Setup。PyInstaller 不能交叉编译，
+> 没有 macOS/Linux 构建机或 CI，产物就不会存在。
+>
+> **但代码侧离"能跑"比想象中近得多**：94 个模块里 93% 完全无 Windows 依赖，
+> **只有 `audio.py` 一个文件会拦住启动**；其余 6 个模块是"功能降级"而非崩溃。
+> 改掉那 1 个文件，应用就能在 Linux/macOS 上启动。
+>
+> **桌面：Linux 与 macOS 都能做**，真正的工作量在"打包 + 签名 + 更新通道"，
+> 不在重写功能。macOS 还需要 Apple 开发者账号（$99/年）走公证。
 >
 > **手机：能做，但要换架构。** 正确形态是
 > **「pasm-framework 当云端大脑 + 手机只做壳」**——
 > 这也是唯一能让"一套认知能力服务所有终端"的架构，且与框架现有的
-> HTTP 网关 / 多语言客户端设计完全吻合。
+> HTTP 网关 / 流式 SSE / 多语言客户端设计完全吻合。
