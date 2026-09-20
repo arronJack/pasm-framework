@@ -60,12 +60,14 @@
 | --- | --- |
 | 依赖方向（不得反向依赖产品层） | ✅ 无 `pasm_agents` 反向引用 |
 | 分叉铁律（不得复制 `pasm.cognitive` 实现） | ✅ 无越层引用 |
-| 三包版本一致性 | framework **0.3.0** / skills **0.5.2** / agents **0.4.11** |
-| PyPI 实际可用 | framework 0.3.0 ✅ · skills 0.5.2 ✅ · agents 0.4.11 ✅（三层依赖可解析） |
+| 三包版本一致性 | framework **0.4.0** / skills **0.5.2** / agents **0.4.11** |
+| PyPI 实际可用 | framework **0.4.0** ✅ · skills 0.5.2 ✅ · agents 0.4.11 ✅（三层依赖可解析，全新 venv 实机装过） |
 | 守门覆盖 | framework selftest、skills selftest、surface-guard、product-verifier 全绿 |
 
-> 说明：PyPI 上 `pasm-framework` 目前是 **0.3.0**，而仓库 HEAD 已含本轮站点插件与安全修复
-> —— 即**仓库领先于 PyPI**。要不要发 0.4.0 需你确认（见 §5）。
+> 已解决：本轮已把 `pasm-framework` **0.4.0**（含站点式插件与两个越权修复）发布到 PyPI，
+> 并在**全新 venv 从公网索引**装过：`import` 版本号、55 项 selftest、`cs` 横幅、
+> 网关端到端（`/embed.js` / `/console` 双令牌 / 摄取长文 / 访客即时可问）全部通过。
+> `pip install pasm-agents` 也会正确解析出 `framework 0.4.0 + skills 0.5.2`。
 
 ## 4. pasm-qclaw 发行版核查（你问的"Linux / 苹果系统有没有补上"）
 
