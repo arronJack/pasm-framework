@@ -40,8 +40,11 @@ PASM V1 → V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。�
 | `llm_responder` | 可选 LLM 接入（OpenAI 兼容 / DeepSeek / Ollama） | ⬜ 关 |
 | `web_gateway` | 零依赖 HTTP 网关（iframe / REST 外部链接） | ⬜ 关 |
 
-Hook 链：`on_init → on_message_in → on_retrieve → on_reply → on_learn → on_shutdown`。
+Hook 链：`on_init → on_message_in → on_retrieve → on_reply → on_reply_final → on_learn → on_shutdown`。
 **不启用任何插件时，`handle` 行为与 v0.1.0 完全一致**（能力路由 → 回落 chat）。
+
+`on_reply_final` 是**唯一出口**：能力结果 / LLM 回复 / 模板兜底 / 被拦截，四条路径
+出站前都经过它恰好一次 —— 护栏因此不可能被某条路径绕过。
 
 ### 用插件开关"定制应用"
 
@@ -66,24 +69,36 @@ agent.serve(port=8080)                    # 站点 <iframe src="http://host:8080
 agent.close()                             # 跑 on_shutdown，停网关
 ```
 
-### 写自己的插件（可发布到 PyPI 被自动发现）
+### 写自己的插件
 
 ```python
 from pasm_framework import BasePlugin, PluginContext
 
-class MyPlugin(BasePlugin):
-    name, version = "my_plugin", "0.1.0"
-    def on_reply(self, ctx: PluginContext) -> None:
-        if not ctx.message.reply:
-            ctx.message.reply = "来自我的插件"
-
-my_plugin = MyPlugin
+class SlaPlugin(BasePlugin):
+    name, version = "sla", "0.1.0"
+    def on_reply_final(self, ctx: PluginContext) -> None:
+        # 收尾阶段：对已经定稿的回复做后处理
+        if ctx.message.reply:
+            ctx.message.reply += "\n（本次回复已记录）"
 ```
-在 `pyproject.toml` 声明 entry-point，框架启动时自动发现：
+
+**注册方式一（推荐）：配置里内联，不用发包**
+
+```python
+app = MyApp("demo", {"name": "小智"}, backend_config={
+    "sla": {"enabled": True, "class": SlaPlugin},
+})
+```
+
+**注册方式二：发布成可发现包**，安装即被自动发现
+
 ```toml
 [project.entry-points."pasm_framework.plugins"]
-my_plugin = "my_pkg.my_module:MyPlugin"
+sla = "my_pkg.my_module:SlaPlugin"
 ```
+
+⚠️ 插件名**拼错不会静默通过**：`app.plugins.unknown()`、`app.app_summary()["plugin_config_unknown"]`
+以及 `pasm-framework doctor` 都会报告。
 
 ## 参考实现：站点智能客服
 
@@ -111,17 +126,61 @@ pip install pasm-framework
 # 基座会被自动作为依赖装上：pasm-skills>=0.5.1
 ```
 
-## 快速自检
+## 配置系统（v0.2.1 新增）
+
+开关表可以来自**预设 / 文件 / 环境变量 / 代码**，优先级由低到高：
+
+```python
+from pasm_framework import load
+
+cfg = load("server.json",                  # 文件（.json / .yaml）
+           preset_name="chatbot",          # 场景预设打底
+           env=True,                       # 叠加 PASM_* 环境变量
+           web_gateway={"config": {"port": 9000}})   # 代码覆盖一切
+
+app = MyApp("demo", {"name": "小智"}, backend_config=cfg)
+```
+
+6 套场景预设：`minimal`（全关，退回 0.1.0 行为）· `default` ·
+`chatbot`（护栏 block + 开网关）· `game_npc`（离线优先）·
+`api`（回复不润色）· `desktop`（只监听本机）。
+
+环境变量：`PASM_PLUGINS` / `PASM_KB_DIR` / `PASM_SAFETY_MODE` /
+`PASM_LLM_PROVIDER` `PASM_LLM_MODEL` `PASM_LLM_API_KEY` /
+`PASM_HTTP_HOST` `PASM_HTTP_PORT` `PASM_HTTP_TOKEN`。
+
+## CLI
 
 ```bash
-python -m pasm_framework selftest
-python -m pasm_framework version
+pasm-framework                    # 自检 + 用法
+pasm-framework doctor             # 环境体检（出问题先跑这个）
+pasm-framework new myapp --kind chatbot     # 生成可跑的项目
+pasm-framework serve --port 8080            # 起一个演示客服
+pasm-framework plugins                      # 看内置插件与默认开关
+pasm-framework config --preset api --env    # 看最终解析出的配置
 ```
 
 ## 最小示例
 
+最省事（v0.2.1 起，3 行起步）：
+
 ```python
-from pasm_framework import BaseApplication, Capability, CapabilityDiscovery
+from pasm_framework import SimpleApplication, capability, load
+
+class MyApp(SimpleApplication):
+    @capability(keywords=("帮助", "help"))
+    def help(self, text):
+        return "我能回答资料库里的问题。"
+
+app = MyApp("demo", {"name": "小智"},
+            backend_config=load(preset_name="chatbot"))
+print(app.ask("帮助"))
+```
+
+需要完全控制时，继承 `BaseApplication`：
+
+```python
+from pasm_framework import BaseApplication, Capability
 
 class MyApp(BaseApplication):
     def action_pool(self):
@@ -132,6 +191,26 @@ class MyApp(BaseApplication):
 app = MyApp(agent_id="demo", persona={"name": "demo"}, persist_dir="/tmp/demo")
 print(app.handle("你好"))          # → "reply:你好"（回落 chat）
 ```
+
+## 快速自检
+
+```bash
+python -m pasm_framework selftest      # 36 项
+python -m pasm_framework version
+```
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [`docs/tutorials/`](docs/tutorials/README.md) | **开发教程**：快速上手 → 能力/插件 → 客服/LLM/部署 → 游戏 NPC → 多语言 |
+| [`docs/capability-matrix-2026-09-20.md`](docs/capability-matrix-2026-09-20.md) | 能力就绪度复检：能做/不能做、剩余问题、性能实测 |
+| [`docs/polyglot-strategy.md`](docs/polyglot-strategy.md) | C#/Java/PHP 怎么接入（协议优先，不移植引擎） |
+| [`docs/cross-platform-strategy.md`](docs/cross-platform-strategy.md) | 桌面端跨 Linux/macOS、手机端换架构方案 |
+| [`docs/customer-service-plugin.md`](docs/customer-service-plugin.md) | 智能客服可行性与部署形态研究 |
+| [`docs/audit-2026-09-20.md`](docs/audit-2026-09-20.md) | v0.2.0 体检报告 |
+| [`docs/openapi.yaml`](docs/openapi.yaml) | HTTP 契约（单一真相源） |
+| [`sdks/`](sdks/README.md) | C# / Java / PHP / Node / Go / Python 客户端 |
 
 ## 许可证
 

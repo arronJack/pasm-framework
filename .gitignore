@@ -16,3 +16,10 @@ dist/
 .tox/
 tmp/
 *.log
+
+# 运行时产物：示例脚本若用固定路径会在这里落盘。
+# 演示脚本本身已改用临时目录，这几行是给"自己 clone 下来跑"的人兜底。
+npc_save/
+minimal_kb/
+kb/
+*.jsonl

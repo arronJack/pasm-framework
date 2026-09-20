@@ -16,7 +16,14 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
   · ``BaseApplication``                            —— 通用 AI 应用底座（建在 BaseAgent 上）；
   · ``BaseSkill`` / ``SkillManifest``              —— 技能包代码化底座；
   · ``plugins``（PluginManager / BasePlugin / …）  —— **插件子系统（v0.2.0）**：
-    把会话 / 知识库 / LLM / 温度 / 安全 / 可观测 / Web 网关做成可开关的即插即用插件。
+    把会话 / 知识库 / LLM / 温度 / 安全 / 可观测 / Web 网关做成可开关的即插即用插件；
+  · ``SimpleApplication`` / ``capability``         —— **低门槛底座（v0.2.1）**：3 行起步；
+  · ``load`` / ``preset`` / ``save``               —— **配置系统（v0.2.1）**：
+    预设 / 文件 / 环境变量 / 代码四级覆盖。
+
+开发效率工具（CLI，``python -m pasm_framework``）
+-------------------------------------------------
+  ``selftest`` · ``version`` · ``plugins`` · ``config`` · ``doctor`` · ``new`` · ``serve``
 
 依赖关系（单一方向，无环）
 --------------------------
@@ -32,7 +39,7 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
 """
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from .adapter import (  # noqa: F401
     DomainAdapter,
@@ -40,6 +47,14 @@ from .adapter import (  # noqa: F401
     StaticDomainAdapter,
 )
 from .application import BaseApplication  # noqa: F401
+from .config import (  # noqa: F401  配置系统：预设 / 文件 / 环境变量
+    PRESETS,
+    describe,
+    load,
+    preset,
+    save,
+    to_dict,
+)
 from .discovery import (  # noqa: F401
     Capability,
     CapabilityDiscovery,
@@ -63,6 +78,10 @@ from .service import (  # noqa: F401
     CognitiveAssembler,
     CognitiveService,
 )
+from .simple import (  # noqa: F401  低门槛应用底座（3 行起步）
+    SimpleApplication,
+    capability,
+)
 from .skill import (  # noqa: F401
     BaseSkill,
     SkillManifest,
@@ -82,11 +101,20 @@ __all__ = [
     "Capability",
     "CapabilityDiscovery",
     "BaseApplication",
+    "SimpleApplication",
+    "capability",
     "BaseSkill",
     "SkillManifest",
     "FrameworkError",
     "SurfaceMissing",
     "BackendContractBroken",
+    # —— 配置系统 ——
+    "load",
+    "preset",
+    "save",
+    "to_dict",
+    "describe",
+    "PRESETS",
     # —— 插件子系统 ——
     "PluginManager",
     "Plugin",
@@ -161,8 +189,11 @@ def selftest() -> bool:
                 capabilities=[Capability("广告设计", run=_run, keywords=("广告",))],
                 persist_dir=td,
             )
-            check(app.handle("广告一张海报") == "广告已生成",
-                  "BaseApplication.handle 走能力路由")
+            # 注：v0.2.1 起能力结果也会经过收尾阶段（护栏/温度），
+            # 因此断言从"全等"改为"能力结果构成回复主体"——
+            # 这才是本条要守的不变式（能力路由优先于 chat）。
+            check("广告已生成" in app.handle("广告一张海报"),
+                  "BaseApplication.handle 走能力路由（能力结果进入回复）")
             check(app.handle("你好").startswith("chat:"),
                   "BaseApplication.handle 回落 chat")
             check("广告设计" in app.app_summary()["capabilities"],
@@ -170,8 +201,8 @@ def selftest() -> bool:
 
             # ---- 插件子系统（v0.2.0 新增）----
             from .plugins import (
-                BackendConfig, Message, PluginContext,
-                builtin_plugins, build_manager,
+                BackendConfig, BasePlugin, Message, PluginContext,
+                PluginManager, builtin_plugins, build_manager,
             )
             bp = builtin_plugins()
             check(len(bp) >= 7, "内置插件库含 7 个插件")
@@ -226,8 +257,8 @@ def selftest() -> bool:
                 capabilities=[Capability("广告设计", run=_run, keywords=("广告",))],
                 persist_dir=td,
             )
-            check(app2.handle("广告一张海报") == "广告已生成",
-                  "插件化 handle：能力路由仍生效")
+            check("广告已生成" in app2.handle("广告一张海报"),
+                  "插件化 handle：能力路由仍生效（能力结果进入回复）")
             r = app2.handle("你好")
             check(isinstance(r, str) and len(r) > 0,
                   "插件化 handle：回落返回非空回复")
@@ -235,6 +266,164 @@ def selftest() -> bool:
                   "app_summary 暴露已启用插件")
             gw = pm.get("web_gateway")
             check(gw is not None, "web_gateway 插件可构造（不启动服务器）")
+
+            # ---- v0.2.1 收尾阶段不变式 ----
+            # 1) on_reply_final 对**每条**回复路径恰好跑一次（生成/能力/模板）。
+            class _Probe(BasePlugin):
+                name = "probe"
+                version = "1"
+
+                def __init__(self):
+                    super().__init__({})
+                    self.final = 0
+                    self.gen = 0
+
+                def on_reply(self, ctx):
+                    self.gen += 1
+
+                def on_reply_final(self, ctx):
+                    self.final += 1
+
+            probe = _Probe()
+            pm_probe = PluginManager()
+            pm_probe.register(probe)
+
+            class _App3(BaseApplication):
+                def action_pool(self):
+                    return ["a"]
+
+                def _render_reply(self, text, facts, mood):
+                    return "tpl"
+
+            app3 = _App3(
+                agent_id="_fw_app3", persona={"name": "p3"},
+                capabilities=[Capability("广告设计", run=_run, keywords=("广告",))],
+                persist_dir=td, plugins=pm_probe,
+            )
+            app3.handle("广告一张海报")   # 路径 A：能力
+            app3.handle("你好")           # 路径 B：模板
+            check(probe.final == 2,
+                  "on_reply_final 对每条路径恰好跑一次（实测 %d 次）" % probe.final)
+
+            # 2) 护栏必须覆盖**模板兜底**路径（v0.2.0 的绕过缺陷）。
+            class _PiiApp(BaseApplication):
+                def action_pool(self):
+                    return ["a"]
+
+                def _render_reply(self, text, facts, mood):
+                    return "手机号 13812345678 请查收"
+
+            pii = _PiiApp(
+                agent_id="_fw_pii", persona={"name": "p4"}, persist_dir=td,
+                backend_config={"safety": {"enabled": True,
+                                           "config": {"mode": "warn"}},
+                                "warmth": {"enabled": False, "config": {}},
+                                "knowledge_base": {"enabled": False, "config": {}},
+                                "sessions": {"enabled": False, "config": {}},
+                                "observability": {"enabled": False, "config": {}}},
+            )
+            out = pii.handle("你好")
+            check("13812345678" not in out and "脱敏" in out,
+                  "护栏覆盖模板兜底路径（离线回复也脱敏）")
+
+            # 3) 护栏必须覆盖**被拦截**路径（插件塞进 msg.reply 的文本也要过护栏）。
+            class _LeakPlugin(BasePlugin):
+                name = "_fw_leak"
+
+                def on_message_in(self, ctx):
+                    if "泄密" in ctx.message.text:
+                        ctx.message.stop = True
+                        ctx.message.reply = "已拦截，管理员手机号 13900001111"
+
+            leaky = _PiiApp(
+                agent_id="_fw_leak", persona={"name": "p5"}, persist_dir=td,
+                backend_config={"safety": {"enabled": True, "config": {}},
+                                "warmth": {"enabled": False, "config": {}},
+                                "knowledge_base": {"enabled": False, "config": {}},
+                                "_fw_leak": {"enabled": True, "class": _LeakPlugin}},
+            )
+            lk = leaky.handle("泄密")
+            check("13900001111" not in lk and "脱敏" in lk,
+                  "护栏覆盖拦截路径（on_message_in 短路也走收尾）")
+
+            # 4) 自定义插件可经 backend_config 内联注册（不发布 entry-point 包）。
+            check("_fw_leak" in leaky.plugins.names(),
+                  "backend_config 内联 class= 可注册自定义插件")
+            typo = _PiiApp(
+                agent_id="_fw_typo", persona={"name": "p6"}, persist_dir=td,
+                backend_config={"knowlege_base": {"enabled": True}},
+            )
+            check(typo.plugins.unknown() == ["knowlege_base"],
+                  "拼错的插件名被记录而非静默忽略")
+
+            # 5) 风格润色跳过能力输出、但护栏仍生效（两者关注点分离）。
+            class _CapApp(BaseApplication):
+                def action_pool(self):
+                    return ["a"]
+
+                def _render_reply(self, text, facts, mood):
+                    return "tpl"
+
+            capapp = _CapApp(
+                agent_id="_fw_cap", persona={"name": "p7"}, persist_dir=td,
+                capabilities=[Capability("查号", run=lambda a, t: "尾号 13800138000",
+                                         keywords=("查号",))],
+                backend_config={"safety": {"enabled": True, "config": {}},
+                                "warmth": {"enabled": True, "config": {}},
+                                "knowledge_base": {"enabled": False, "config": {}},
+                                "sessions": {"enabled": False, "config": {}}},
+            )
+            cap_out = capapp.handle("查号")
+            check(cap_out.startswith("尾号") and "脱敏" in cap_out,
+                  "能力输出：风格不润色 / 护栏仍脱敏")
+
+            # ---- v0.2.1 配置系统 ----
+            from .config import PLUGIN_NAMES, PRESETS, describe, load, to_dict
+            check(len(PRESETS) >= 6, "场景预设 >= 6 套（实测 %d）" % len(PRESETS))
+            cfg_min = load(preset_name="minimal")
+            check(all(not cfg_min.entry(n).get("enabled") for n in PLUGIN_NAMES),
+                  "preset=minimal 时全部插件关闭")
+            cfg_api = load(preset_name="api")
+            check(cfg_api.entry("safety")["config"].get("mode") == "block"
+                  and cfg_api.entry("web_gateway")["config"].get("port") == 8080,
+                  "preset=api 解析出 block 护栏与网关端口")
+            # 覆盖优先级：显式入参应压过预设
+            cfg_ov = load(preset_name="api",
+                          web_gateway={"config": {"port": 9999}})
+            check(cfg_ov.entry("web_gateway")["config"]["port"] == 9999,
+                  "显式覆盖优先于预设")
+            check(len(describe(cfg_ov)) == len(PLUGIN_NAMES)
+                  and "web_gateway" in to_dict(cfg_ov)["plugins"],
+                  "describe/to_dict 覆盖全部插件")
+
+            # ---- v0.2.1 SimpleApplication + @capability ----
+            from .simple import SimpleApplication, capability
+
+            class _Shop(SimpleApplication):
+                @capability(keywords=("退款", "退钱"))
+                def refund(self, text):
+                    return "退款入口:/refund"
+
+            shop = _Shop("_fw_shop", {"name": "客服"}, persist_dir=td,
+                         backend_config=load(preset_name="minimal"))
+            check(shop.ask("我要退款") == "退款入口:/refund",
+                  "SimpleApplication 的 @capability 自动注册并命中")
+            check(shop.ask("今天天气不错").startswith("抱歉"),
+                  "SimpleApplication 未命中时给出兜底话术")
+
+            # ---- v0.2.1 脚手架 ----
+            from .scaffold import KINDS, create, render
+            files = render("chatbot", "demo-shop")
+            check({"main.py", "config.json", "README.md"} <= set(files),
+                  "脚手架 chatbot 模板产出关键文件")
+            import os as _os
+            target = _os.path.join(td, "scaffold_out")
+            written = create(target, kind="chatbot", name="demo-shop")
+            check("main.py" in written
+                  and _os.path.isfile(_os.path.join(target, "main.py")),
+                  "脚手架 create 真正落盘")
+            check(set(KINDS) >= {"app", "chatbot", "game_npc"},
+                  "脚手架提供 3 种模板")
     except Exception as ex:                          # noqa: BLE001
         check(False, "应用开发框架表面可装配（异常：%s）" % ex)
 

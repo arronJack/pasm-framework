@@ -1,0 +1,299 @@
+openapi: 3.0.3
+info:
+  title: pasm-framework Gateway API
+  version: 0.2.1
+  description: |
+    pasm-framework 的 HTTP 契约（**单一真相源**）。
+
+    任何语言接入都应该以本文件为准；改接口请先改这里，再改
+    `pasm_framework/plugins/builtins/web_gateway.py` 与 `sdks/`。
+
+    鉴权：配置了 `token` 时，除 `/healthz` 外所有接口都要求
+    `Authorization: Bearer <token>` 或 `X-Pasm-Token: <token>`。
+    未配置 token 时开放（仅建议用于本机/内网）。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本机默认（pasm-framework serve 默认端口）
+tags:
+  - name: chat
+  - name: knowledge
+  - name: ops
+
+paths:
+  /api/chat:
+    post:
+      tags: [chat]
+      summary: 发送一条用户消息，取回助手回复
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  description: 用户输入
+                  example: 怎么退货？
+                session_id:
+                  type: string
+                  default: default
+                  description: 会话标识；不同 session 之间的历史互相隔离
+                user_id:
+                  type: string
+                  nullable: true
+                  description: 用户标识（用于租户/个性化，当前版本仅记录）
+                meta:
+                  type: object
+                  additionalProperties: true
+                  description: 透传给插件的附加信息
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reply: { type: string }
+                  session_id: { type: string }
+              example:
+                reply: 商品签收后 7 天内可无理由退货，需保持吊牌完整。
+                session_id: web-abc123
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/ingest:
+    post:
+      tags: [knowledge]
+      summary: 把站点数据推进资料库（CMS / 爬虫 / 帮助中心同步）
+      description: 需要启用 `knowledge_base` 插件，否则返回 409。
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      title: { type: string }
+                      content: { type: string }
+                      source: { type: string, default: ingest }
+                      tags:
+                        type: array
+                        items: { type: string }
+              example:
+                items:
+                  - title: 退货政策
+                    content: 商品签收后 7 天内可无理由退货。
+                    source: faq
+                    tags: [退货, 售后]
+      responses:
+        "200":
+          description: 摄取成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  added: { type: integer }
+                  total: { type: integer }
+                  docs: { type: integer }
+                  qa: { type: integer }
+                  enabled: { type: boolean }
+        "409":
+          description: knowledge_base 插件未启用
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/sessions/reset:
+    post:
+      tags: [chat]
+      summary: 清空某个会话的历史
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id: { type: string }
+      responses:
+        "200":
+          description: 已重置
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  session_id: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/plugins:
+    get:
+      tags: [ops]
+      summary: 列出已加载与已启用的插件
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  all:
+                    type: array
+                    items: { type: string }
+                  enabled:
+                    type: array
+                    items: { type: string }
+
+  /api/summary:
+    get:
+      tags: [ops]
+      summary: 应用快照（能力、插件、指标）
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/kb/stats:
+    get:
+      tags: [knowledge]
+      summary: 资料库统计
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer }
+                  docs: { type: integer }
+                  qa: { type: integer }
+                  enabled: { type: boolean }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 健康检查（**免鉴权**，供探针使用）
+      security: []
+      responses:
+        "200":
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded]
+                  listening: { type: boolean }
+                  host: { type: string }
+                  port: { type: integer }
+                  auth_required: { type: boolean }
+                  metrics:
+                    type: object
+                    additionalProperties: true
+
+  /:
+    get:
+      tags: [chat]
+      summary: 自包含的可嵌入聊天 Widget（HTML）
+      description: 站点用 `<iframe src="http://host:port/">` 一行嵌入。
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      responses:
+        "200":
+          description: HTML 页面
+          content:
+            text/html:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    tokenHeader:
+      type: apiKey
+      in: header
+      name: X-Pasm-Token
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        hint: { type: string }
+
+  responses:
+    BadRequest:
+      description: 请求参数错误
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: 鉴权失败
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: unauthorized
+            hint: 请在请求头带 Authorization Bearer token
+    TooLarge:
+      description: 请求体超过 max_body
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: 触发限流
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

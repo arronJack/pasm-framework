@@ -21,6 +21,18 @@ v0.1.0 的 ``BaseApplication`` 把所有 concern（会话、检索增强、回�
    （group = ``pasm_framework.plugins``）自动发现第三方插件。
 3. **向后兼容**：不启用任何插件时，``BaseApplication.handle`` 行为与 v0.1.0 完全一致
    （能力路由 → 回落 chat）。
+
+两个回复阶段的区别（v0.2.1 起，别混用）
+--------------------------------------
+  · ``on_reply``       —— **生成**阶段：谁来产出 assistant 文本（``llm_responder``）。
+    只有"还没有回复"时才被期待产出内容；此时 ``msg.reply`` 通常为空。
+  · ``on_reply_final`` —— **收尾**阶段：对**已经定稿**的回复做后处理
+    （``safety`` 脱敏、``warmth`` 润色）。由 ``BaseApplication`` 在
+    "所有回复路径汇合之后的唯一出口"调用，因此**恰好跑一次**。
+
+为什么需要 ``on_reply_final``：v0.2.0 把护栏/润色挂在 ``on_reply`` 上，
+而模板兜底回复（未开 LLM 的离线路径）在 ``on_reply`` **之后**才生成，
+导致兜底回复绕过了护栏。拆出收尾阶段后，LLM 回复与模板回复走同一条出口。
 """
 from __future__ import annotations
 
@@ -122,6 +134,7 @@ class Plugin(Protocol):
     def on_message_in(self, ctx: PluginContext) -> None: ...
     def on_retrieve(self, ctx: PluginContext) -> None: ...
     def on_reply(self, ctx: PluginContext) -> None: ...
+    def on_reply_final(self, ctx: PluginContext) -> None: ...
     def on_learn(self, ctx: PluginContext) -> None: ...
     def on_shutdown(self, ctx: PluginContext) -> None: ...
 
@@ -150,6 +163,11 @@ class BasePlugin:
         pass
 
     def on_reply(self, ctx: PluginContext) -> None:
+        """生成阶段：产出 assistant 回复（如 LLM）。"""
+        pass
+
+    def on_reply_final(self, ctx: PluginContext) -> None:
+        """收尾阶段：对定稿回复做后处理（护栏 / 润色）。恰好跑一次。"""
         pass
 
     def on_learn(self, ctx: PluginContext) -> None:
@@ -165,11 +183,14 @@ class BasePlugin:
 # ============================================================ 插件管理器
 
 # 链上的 Hook 顺序（执行顺序即列表顺序）。
+# 注意 on_reply（生成）与 on_reply_final（收尾）是**两个不同阶段**，
+# 由 BaseApplication.handle 在各自的时间点分别触发，不要合并。
 HOOKS: List[str] = [
     "on_init",
     "on_message_in",
     "on_retrieve",
     "on_reply",
+    "on_reply_final",
     "on_learn",
     "on_shutdown",
 ]
@@ -188,6 +209,13 @@ class PluginManager:
         self._plugins: List[BasePlugin] = []
         self._enabled: Dict[str, bool] = {}
         self._bootstrapped = False
+        # 配置里出现、但既不是内置插件也没有 class/instance 的名字。
+        # 多半是拼写错误 —— 静默忽略会让人以为"插件生效了"，故显式记录。
+        self._unknown: List[str] = []
+
+    def unknown(self) -> List[str]:
+        """返回"配置里有、但没匹配到任何插件"的名字（疑似拼写错误）。"""
+        return list(self._unknown)
 
     def register(self, plugin: BasePlugin, *, enabled: bool = True) -> None:
         if not hasattr(plugin, "name"):
@@ -305,12 +333,30 @@ def build_manager(
 ) -> PluginManager:
     """从 ``BackendConfig`` 装配出 ``PluginManager``。
 
-    - builtin 插件来自 :func:`pasm_framework.plugins.registry.builtin_plugins`；
-    - 若 ``config`` 为 None，使用 :func:`default_config` 的默认开关；
-    - 第三方插件通过 entry-point（group=``pasm_framework.plugins``）自动发现。
+    三条来源，按顺序：
+      1. **内置插件** —— :func:`pasm_framework.plugins.registry.builtin_plugins`；
+      2. **entry-point 插件** —— group=``pasm_framework.plugins`` 自动发现；
+      3. **内联自定义插件** —— 配置项里写 ``class`` 或 ``instance``：
+
+         .. code-block:: python
+
+             backend_config = {
+                 "my_rule": {"enabled": True, "class": MyRulePlugin},
+                 "knowledge_base": {"enabled": True, "config": {...}},
+             }
+
+         这样用户不发布包也能接入自己的插件（框架是"通用底层"，必须留这个口）。
+
+    若 ``config`` 为 None，使用 :func:`default_config` 的默认开关。
+
+    配置里出现但没有任何插件匹配的名字，会记进 ``pm.unknown()`` 而不是被
+    静默丢弃 —— 拼错插件名是最常见的"以为开了其实没开"来源。
     """
     from .registry import builtin_plugins, discover_plugins, default_config
 
+    # 宽容：允许直接传 dict（与 BaseApplication(backend_config={...}) 保持一致）。
+    if config is not None and not isinstance(config, BackendConfig):
+        config = BackendConfig(plugins=dict(config))
     cfg = config or default_config()
     pm = PluginManager()
 
@@ -326,9 +372,35 @@ def build_manager(
             name = getattr(plugin, "name", None)
             if name is None:
                 continue
+            if pm.get(name) is not None:      # 同名的内置插件优先，避免重复挂链
+                continue
             entry = cfg.entry(name)
             enabled = entry.get("enabled", False)
             pm.register(plugin, enabled=enabled)
+
+    # ---- 内联自定义插件 ----
+    for name, raw in cfg.plugins.items():
+        if pm.get(name) is not None:
+            continue
+        spec = raw if isinstance(raw, dict) else {}
+        obj = spec.get("instance")
+        if obj is None:
+            cls = spec.get("class")
+            if cls is None:
+                pm._unknown.append(name)      # 既不是内置、也没给类 → 疑似拼错
+                continue
+            try:
+                obj = cls(config=spec.get("config", {}))
+            except TypeError:
+                # 宽容：也接受只收一个位置参数的构造函数。
+                obj = cls(spec.get("config", {}))
+        if not isinstance(obj, BasePlugin):
+            pm._unknown.append(name)
+            continue
+        # 允许配置名与插件自带 name 不同（便于同一插件多实例）。
+        if isinstance(raw, dict) and raw.get("as"):
+            obj.name = str(raw["as"])
+        pm.register(obj, enabled=bool(spec.get("enabled", True)))
 
     return pm
 

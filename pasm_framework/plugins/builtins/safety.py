@@ -74,7 +74,14 @@ class SafetyPlugin(BasePlugin):
                 _EMAIL.search(msg.text) or _PHONE.search(msg.text)
             )
 
-    def on_reply(self, ctx: PluginContext) -> None:
+    def on_reply_final(self, ctx: PluginContext) -> None:
+        """出站脱敏。挂在 **收尾阶段**（而非 ``on_reply``）至关重要：
+
+        ``on_reply`` 阶段模板兜底回复尚未生成，挂在那里会导致
+        "未接 LLM 的离线模式"回复完全绕过护栏（v0.2.0 缺陷）。
+        收尾阶段由 ``BaseApplication.handle`` 在唯一出口调用，
+        LLM 回复与模板回复都会被脱敏。
+        """
         if not self._redact_pii:
             return
         msg: Message = ctx.message
