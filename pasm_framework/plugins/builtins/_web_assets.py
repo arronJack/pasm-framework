@@ -317,6 +317,16 @@ pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;overfl
   var TOKKEY = "pasm_console_token";
   var TOKEN = "";
   try { TOKEN = sessionStorage.getItem(TOKKEY) || ""; } catch (e) {}
+  // 支持 ?token=<管理令牌> 直接进入 —— 浏览器导航发不了请求头。
+  // 读到后存进 sessionStorage，并**从地址栏抹掉**：避免令牌留在浏览历史 / 截图里。
+  try {
+    var q = new URLSearchParams(location.search).get("token");
+    if (q) {
+      TOKEN = q;
+      try { sessionStorage.setItem(TOKKEY, q); } catch (e2) {}
+      if (history.replaceState) { history.replaceState(null, "", location.pathname); }
+    }
+  } catch (e3) {}
 
   function toast(m) {
     var t = $("toast"); t.textContent = m; t.className = "on";

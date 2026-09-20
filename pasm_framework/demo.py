@@ -53,9 +53,13 @@ def make_demo_app(
     agent_id: str = "pasm-demo",
     preset_name: str = "chatbot",
     token: Optional[str] = None,
+    public_token: Optional[str] = None,
     teach: bool = True,
 ) -> DemoAgent:
     """构造演示应用（已导入 :data:`DEMO_FAQ`）。
+
+    ``token`` 是**管理令牌**（全部接口）；``public_token`` 是**访客令牌**
+    （仅对话接口，可安全嵌进第三方站点）。只给 ``token`` 时行为同旧版。
 
     >>> from pasm_framework.demo import make_demo_app
     >>> app = make_demo_app(port=8099)
@@ -65,6 +69,8 @@ def make_demo_app(
     gw: Dict[str, Any] = {"enabled": True, "config": {"host": host, "port": port}}
     if token:
         gw["config"]["token"] = token
+    if public_token:
+        gw["config"]["public_token"] = public_token
     kb: Dict[str, Any] = {"enabled": True}
     if kb_dir:
         kb["config"] = {"kb_dir": kb_dir}

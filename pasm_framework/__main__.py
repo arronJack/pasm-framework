@@ -6,8 +6,9 @@
     pasm-framework plugins            列出内置插件与默认开关
     pasm-framework config [--preset X | --file f.json] [--env]   查看解析后的开关表
     pasm-framework doctor             环境体检（能不能跑、缺什么）
-    pasm-framework new <dir> [--kind app|chatbot|game_npc] [--force]   生成项目
+    pasm-framework new <dir> [--kind app|chatbot|game_npc|customer_service] [--force]   生成项目
     pasm-framework serve [--port 8080] [--host 0.0.0.0] [--kb ./kb]   起一个演示客服
+    pasm-framework cs [--port 8080] [--name X]      一键起在线客服（双令牌+嵌入码+管理台）
 
 设计约束：只用标准库 ``argparse``，不引入 CLI 框架 —— 保证"装完就能跑"。
 """
@@ -210,6 +211,74 @@ def _cmd_serve(args) -> int:
     return 0
 
 
+def _cmd_cs(args) -> int:
+    """一键起在线客服：自动生成双令牌，打印可分享链接与嵌入代码。
+
+    面向"不懂代码也能跑"：一条命令拿到
+      · 访客对话页（可直接分享 / iframe 嵌入）
+      · 站长管理台（粘贴资料 → 立即生效）
+      · 一行 <script> 嵌入代码（任意语言开发的站点都能挂）
+    """
+    import time
+    import secrets
+
+    from .demo import make_demo_app
+
+    serve_token = args.serve_token or secrets.token_hex(8)
+    public_token = args.public_token or secrets.token_hex(8)
+
+    llm = None
+    if args.llm_provider:
+        llm = {"provider": args.llm_provider}
+        if args.llm_model:
+            llm["model"] = args.llm_model
+        if args.llm_key:
+            llm["api_key"] = args.llm_key
+
+    app = make_demo_app(kb_dir=args.kb, llm=llm, host=args.host, port=args.port,
+                        token=serve_token, public_token=public_token,
+                        preset_name="chatbot")
+
+    shown_host = args.host if args.host != "0.0.0.0" else "127.0.0.1"
+    base = "http://%s:%d" % (shown_host, args.port)
+    lan = "http://<你的局域网IP>:%d" % args.port if args.host == "0.0.0.0" else base
+    # 属性名必须与 embed.js 读取的一致（data-pasm-token），否则挂件拿不到令牌。
+    embed = ("<script src=\"%s/embed.js\"\n"
+             "        data-pasm-token=\"%s\"\n"
+             "        data-title=\"%s\"\n"
+             "        data-greeting=\"你好！我是智能客服，有什么可以帮你？\"\n"
+             "        data-color=\"#2563eb\" defer></script>"
+             % (lan, public_token, args.name))
+
+    print("=" * 62)
+    print("在线客服已启动（%s）" % args.name)
+    print("=" * 62)
+    print("① 访客对话页（分享给客户 / 直接打开测试）:")
+    print("     %s/" % base)
+    print("② 站长管理台（粘贴资料 → 访客立即能答）:")
+    print("     %s/console?token=%s" % (base, serve_token))
+    print("     （链接已带管理令牌；打开后令牌会从地址栏消失，存进本次会话）")
+    print("③ 嵌入你自己的站点（任意语言：PHP/Java/Node/静态页均可）:")
+    print("     在 </body> 前加这几行：")
+    print("       %s" % embed.replace("\n", "\n       "))
+    print("④ REST 接口（程序对接）:")
+    print("     POST %s/api/chat   {\"text\": \"...\"}" % base)
+    print("     Header: Authorization: Bearer %s" % public_token)
+    print("-" * 62)
+    print("令牌说明：公开令牌只能对话；管理令牌才能导入资料/看会话。")
+    print("资料来源：启动时自动导入演示 FAQ；往 %s 放 .txt/.md 或在管理台粘贴即可。" % (args.kb or "~/.pasm_framework/kb"))
+    print("Ctrl+C 退出")
+    print("=" * 62)
+    try:
+        app.serve()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n已停止。")
+        app.close()
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else "selftest"
@@ -260,6 +329,21 @@ def main(argv=None) -> int:
     p_srv.add_argument("--llm-model", default=None)
     p_srv.add_argument("--llm-key", default=None)
 
+    p_cs = sub.add_parser("cs", help="一键起在线客服（双令牌 + 可分享链接 + 嵌入代码）")
+    p_cs.add_argument("--name", default="在线客服", help="客服名（打印在横幅里）")
+    p_cs.add_argument("--host", default="127.0.0.1",
+                      help="0.0.0.0 表示允许局域网访问")
+    p_cs.add_argument("--port", type=int, default=8080)
+    p_cs.add_argument("--kb", default=None, help="知识库目录（默认 ~/.pasm_framework/kb）")
+    p_cs.add_argument("--serve-token", dest="serve_token", default=None,
+                      help="管理令牌（缺省自动生成）")
+    p_cs.add_argument("--public-token", dest="public_token", default=None,
+                      help="公开令牌（缺省自动生成）")
+    p_cs.add_argument("--llm-provider", default=None,
+                      help="openai / deepseek / ollama（不填则离线模式）")
+    p_cs.add_argument("--llm-model", default=None)
+    p_cs.add_argument("--llm-key", default=None)
+
     try:
         ns = parser.parse_args(argv)
     except SystemExit as ex:            # argparse 的报错也是退出
@@ -271,6 +355,7 @@ def main(argv=None) -> int:
         "doctor": _cmd_doctor,
         "new": _cmd_new,
         "serve": _cmd_serve,
+        "cs": _cmd_cs,
     }.get(ns.sub)
     if handler is None:
         print(USAGE)

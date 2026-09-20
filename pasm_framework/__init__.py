@@ -292,6 +292,45 @@ def selftest() -> bool:
             gw = pm.get("web_gateway")
             check(gw is not None, "web_gateway 插件可构造（不启动服务器）")
 
+            # ---- v0.3.1 站点插件安全不变式（不需要起服务器）----
+            # `_Handler._gw` 读的是 `self.server.gateway`，所以给个假 server 就能
+            # 直接调鉴权逻辑，无需真的监听端口。
+            from .plugins.builtins.web_gateway import _Handler as _GWHandler
+
+            class _ProbeHandler(_GWHandler):
+                def __init__(self, gateway, path, headers=None):
+                    self.server = type("_S", (), {"gateway": gateway})()
+                    self.path = path
+                    self.headers = headers or {}
+
+            def _probe(gateway, path, tok=None):
+                h = _ProbeHandler(gateway, path,
+                                  {"Authorization": "Bearer " + tok} if tok else {})
+                return h._authorized(path)
+
+            _g = type(gw)({"token": "ADMIN", "public_token": "PUB"})
+            check(_probe(_g, "/console", "ADMIN") and not _probe(_g, "/console", "PUB"),
+                  "网关：管理台只认管理令牌（公开令牌被拒）")
+            check(not _probe(_g, "/console?token=PUB", "PUB"),
+                  "网关：?token= 携带公开令牌也进不了管理台")
+            _h = _ProbeHandler(_g, "/api/chat", {"Authorization": "Bearer PUB"})
+            check(_h._authorized("/api/chat", admin=False)
+                  and not _h._authorized("/api/chat", admin=True),
+                  "网关：公开令牌仅限对话作用域")
+            check(_probe(_g, "/embed.js") and _probe(_g, "/healthz"),
+                  "网关：/embed.js 与 /healthz 无条件可达")
+            _g2 = type(gw)({"token": "ADMIN"})       # 没配 public_token
+            check(_g2.serve_token == "",
+                  "★ 未配 public_token 时 serve_token 为空（绝不回落管理令牌）")
+            check(_ProbeHandler(_g2, "/")._authorized("/") is False,
+                  "★ 未配 public_token 时挂件页不公开（不泄漏管理令牌）")
+            check(_ProbeHandler(_g2, "/",
+                                {"Authorization": "Bearer ADMIN"})._authorized("/"),
+                  "网关：站长用管理令牌仍可打开挂件页")
+            _g3 = type(gw)({})                       # 无令牌 = 开发开放模式
+            check(_ProbeHandler(_g3, "/console")._authorized("/console"),
+                  "网关：无令牌配置时保持开放（兼容本机开发）")
+
             # ---- v0.2.1 收尾阶段不变式 ----
             # 1) on_reply_final 对**每条**回复路径恰好跑一次（生成/能力/模板）。
             class _Probe(BasePlugin):

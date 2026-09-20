@@ -52,16 +52,22 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 from ..core import BasePlugin, PluginContext
 from ._web_assets import CONSOLE_HTML, EMBED_JS
 
-#: 完全公开的路径（纯静态资产，或按设计就该给访客看的内容）。
-#: 注意它们**本身不含任何密钥**：挂件页里的令牌由 ``public_token`` 注入。
-_PUBLIC_PATHS = ("/", "/widget", "/index.html", "/embed.js", "/console", "/healthz")
+#: 真正**不含任何密钥、可无条件公开**的路径：静态 JS 与健康探针。
+#: 挂件页 / 管理台**不在此列** —— 它们要么注入令牌、要么是管理界面。
+_PUBLIC_PATHS = ("/embed.js", "/healthz")
 
 #: 只需「公开作用域」的路径：对话。其余一律要管理令牌。
 _CHAT_PATHS = ("/api/chat", "/api/chat/stream")
+
+#: 访客可见的挂件页。**仅当配了 ``public_token`` 时才允许公开作用域** ——
+#: 否则 ``serve_token`` 会回落到管理令牌并写进页面源码，
+#: 等于把管理令牌送给每一个打开该页的访客。
+_WIDGET_PATHS = ("/", "/widget", "/index.html")
 
 #: ``ingest_text`` 把长文切成多长的块（字符）。太大 → 检索命中后回复里塞满无关内容；
 #: 太小 → 一句话被切断、语义破碎。800 字符约合中文 2–4 段，是"能独立成条"的量级。
@@ -297,11 +303,26 @@ class _Handler(BaseHTTPRequestHandler):
                 or self.client_address[0])
 
     def _presented_token(self) -> str:
+        """取出调用方出示的令牌。
+
+        支持三种携带方式（按优先级）：
+          1. ``X-Pasm-Token`` 头；
+          2. ``Authorization: Bearer <token>`` 头；
+          3. URL 查询参数 ``?token=`` —— **浏览器直接导航发不了请求头**，
+             站主要能「点开链接就进管理台」，所以必须支持这一种。
+        """
         got = self.headers.get("X-Pasm-Token", "")
         if not got:
             auth = self.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 got = auth[7:].strip()
+        if not got:
+            _, _, query = self.path.partition("?")
+            for part in query.split("&"):
+                k, _, v = part.partition("=")
+                if k == "token" and v:
+                    got = unquote(v)
+                    break
         return got
 
     def _authorized(self, path: str, *, admin: bool = True) -> bool:
@@ -309,16 +330,24 @@ class _Handler(BaseHTTPRequestHandler):
 
         ``admin=True``（默认）→ 只认管理令牌；
         ``admin=False``        → 认管理令牌，若配了 ``public_token`` 也认它（仅对话用）。
+
+        无条件放行的只有两类：
+          · ``_PUBLIC_PATHS``：本身不含任何密钥；
+          · 配了 ``public_token`` 时的挂件页：它注入的就是那个**本就公开**的令牌
+            （站主会把它写进自己站点源码），所以页面可以给访客。
+            没配 ``public_token`` 时挂件页**不公开** —— 否则只能注入管理令牌。
         """
         token = self._gw.token
-        if not token and not self._gw.public_token:
+        pub = self._gw.public_token
+        if not token and not pub:
             return True                       # 完全没设令牌 = 开放模式（本机开发）
         if path in _PUBLIC_PATHS:
-            return True                       # 公开资产，本身不含密钥
+            return True
+        if pub and path in _WIDGET_PATHS:
+            return True                       # 公开令牌本就公开 → 挂件页对访客开放
         got = self._presented_token()
         if token and got == token:
-            return True                       # 管理令牌在两种作用域下都通行
-        pub = self._gw.public_token
+            return True                       # 管理令牌在任何作用域下都通行
         if not admin and pub and got == pub:
             return True
         return False
@@ -371,19 +400,23 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         gw = self._gw
         path = self.path.split("?")[0]
-        # 健康检查免鉴权（容器/反代探针常用），其余一律走守卫。
+        # 作用域判定全部收在 `_authorized` 里：
+        #   · /embed.js、/healthz 无条件放行；
+        #   · 配了 public_token 时挂件页对访客开放（注入的就是公开令牌）；
+        #   · 其余（管理台、各类管理 API）一律管理作用域。
         if not self._guard(path):
             return
         if path in ("/", "/widget", "/index.html"):
-            # 注入**公开令牌**（而非管理令牌）：这个页面是要给访客看的，
-            # 把它 iframe 进站点时，源码里能读到什么，访客就能读到什么。
+            # 注入**公开令牌**（serve_token 只返回 public_token，绝不含管理令牌）。
+            # 该页面是要给访客看的：源码里能读到什么，访客就能读到什么。
             html = _WIDGET_HTML.replace("__TOKEN__", gw.serve_token)
             self._send(200, html, "text/html")
         elif path == "/embed.js":
             # 一行式挂件脚本：不含密钥（令牌由站主的 <script> 标签属性传入）。
             self._send(200, EMBED_JS, "application/javascript")
         elif path == "/console":
-            # 站点主人控制台：静态壳，不含密钥；令牌由使用者在页面里填。
+            # 站点主人控制台：**管理作用域**。浏览器导航发不了请求头，
+            # 所以这里支持 ?token=<管理令牌>，页面会把它存进 sessionStorage。
             self._send(200, CONSOLE_HTML, "text/html")
         elif path == "/healthz":
             self._send(200, gw.health())
@@ -516,9 +549,12 @@ class WebGatewayPlugin(BasePlugin):
     def serve_token(self) -> str:
         """下发给浏览器的令牌（挂件页 / 嵌入代码用）。
 
-        优先 ``public_token``；没配才回落到 ``token``。
+        **只返回 ``public_token``；没配就返回空串 —— 绝不回落到 ``token``。**
+        挂件页与嵌入代码是给访客看的，一旦回落，源码里就能读到管理令牌，
+        等于把整个后台送给任何一个打开网页的人。
+        没配 ``public_token`` 时该页面本身也改为管理作用域，站长自己看没问题。
         """
-        return self.public_token or self.token
+        return self.public_token
 
     def on_init(self, ctx: PluginContext) -> None:
         self._app = ctx.app
