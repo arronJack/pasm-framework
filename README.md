@@ -26,7 +26,7 @@ PASM V1 → V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。�
 
 `CognitiveBackend` 协议的**单一真相源仍在基座** `pasm_skills.sdk.backend`，本包只做重导出。
 
-## 流式与工具调用（v0.3.0 新增）
+## 流式与工具调用（v0.3.0）
 
 **真流式（SSE）** —— `stream()` 与 `handle()` **共用同一条管线**，不会行为漂移：
 
@@ -135,6 +135,48 @@ sla = "my_pkg.my_module:SlaPlugin"
 ⚠️ 插件名**拼错不会静默通过**：`app.plugins.unknown()`、`app.app_summary()["plugin_config_unknown"]`
 以及 `pasm-framework doctor` 都会报告。
 
+## 一键起在线客服（v0.4.0）
+
+**一条命令**拿到：访客对话页 + 站长管理台 + 一行嵌入代码 + REST 示例（双令牌自动生成）。
+
+```bash
+pasm-framework cs --port 8080 --name "小智客服"
+```
+
+输出会直接给你三段：
+
+```
+① 访客对话页        http://127.0.0.1:8080/
+② 站长管理台        http://127.0.0.1:8080/console?token=<管理令牌>
+③ 嵌入任意语言站点    <script src=".../embed.js" data-pasm-token="<公开令牌>" ...></script>
+```
+
+**站点接入只要一行**（PHP / Java / Node / 静态页都行）：
+
+```html
+<script src="http://你的服务器:8080/embed.js"
+        data-pasm-token="公开令牌"
+        data-title="在线客服"
+        data-greeting="你好！我是智能客服，有什么可以帮你？"
+        data-color="#2563eb" defer></script>
+```
+
+> ⚠️ 属性名必须是 **`data-pasm-token`**（写成 `data-token` 挂件拿不到令牌 → 401）。
+
+**双令牌作用域**（安全红线，selftest 已固化）：
+
+| 令牌 | 能做什么 |
+| --- | --- |
+| `token`（管理） | 全部接口：对话 + 导入资料 + 看会话 + 管理台 |
+| `public_token`（访客） | **仅** `/api/chat`、`/api/chat/stream`；配了它时挂件页对访客开放 |
+
+`serve_token` **只返回 `public_token`，绝不回落管理令牌** —— 挂件页是给访客看的，
+一旦回落，源码里就能读到后台令牌。未配 `public_token` 时挂件页本身也不公开。
+`/embed.js` 与 `/healthz` 是唯一无条件公开的路径（本身不含密钥）。
+
+管理台里可以**粘贴整篇帮助文档**（`POST /api/ingest/text`）自动切块、识别「问：/答：」存成问答对，
+访客立刻就能问到 —— 这就是"资料库自学"的入口。
+
 ## 参考实现：站点智能客服
 
 `apps/customer_service.py` 用插件组合出一个可上线的客服 Agent（零 LLM 也能回答）。
@@ -230,7 +272,7 @@ print(app.handle("你好"))          # → "reply:你好"（回落 chat）
 ## 快速自检
 
 ```bash
-python -m pasm_framework selftest      # 44 项
+python -m pasm_framework selftest      # 55 项
 python -m pasm_framework doctor        # 真装配一遍插件并报拼错的名字
 python -m pasm_framework version
 ```
@@ -245,6 +287,8 @@ python -m pasm_framework version
 | [`docs/cross-platform-strategy.md`](docs/cross-platform-strategy.md) | 桌面端跨 Linux/macOS、手机端换架构方案 |
 | [`docs/customer-service-plugin.md`](docs/customer-service-plugin.md) | 智能客服可行性与部署形态研究 |
 | [`docs/audit-2026-09-20.md`](docs/audit-2026-09-20.md) | v0.2.0 体检报告 |
+| [`docs/plugin-ownership.md`](docs/plugin-ownership.md) | 插件放子目录还是独立仓（决策 + 理由） |
+| [`docs/audit-7repos-2026-09-20.md`](docs/audit-7repos-2026-09-20.md) | **七仓全盘审计**（含跨平台实测） |
 | [`docs/openapi.yaml`](docs/openapi.yaml) | HTTP 契约（单一真相源） |
 | [`sdks/`](sdks/README.md) | C# / Java / PHP / Node / Go / Python 客户端 |
 

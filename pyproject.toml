@@ -1,14 +1,16 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pasm-framework"
-version = "0.3.0"
+version = "0.4.0"
 description = "PASM 应用开发框架 —— 产品智能体/应用与认知引擎之间的防腐层（V1↔V2 唯一变动点）"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+# PEP 639：SPDX 字符串 + 显式许可文件（旧写法 `{ text = "MIT" }` 在 setuptools>=77 会告警）
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "arronzheng" }]
 keywords = [
     "pasm", "agent", "application-framework", "anti-corruption-layer",
@@ -17,7 +19,6 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

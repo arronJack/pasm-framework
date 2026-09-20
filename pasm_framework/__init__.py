@@ -39,7 +39,7 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
 """
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .adapter import (  # noqa: F401
     DomainAdapter,
