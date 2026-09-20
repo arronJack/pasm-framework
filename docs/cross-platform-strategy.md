@@ -93,6 +93,27 @@ _ole32 = ctypes.OleDLL("ole32")            # ← POSIX 无 OleDLL 符号 → Att
 | `logsetup.py` | `ctypes.windll.shell32` 取 APPDATA | 已在 `try/except` 内 → 会退回 `~` |
 | `pasm_main.py` | `ctypes.windll.user32.MessageBoxW` 兜底弹窗 | 已在 `try/except` 内 |
 
+### 1.0.2 ✅ 已落地的修复（2026-09-20，在 PASM 仓）
+
+本文 §1.0.1 列出的"唯一导入期硬拦"**已经修掉**，并补上了跨平台操作层与三平台构建流水线：
+
+| 项 | 状态 | 位置 |
+| --- | --- | --- |
+| `audio.py` 导入期硬拦（`winreg` + `ctypes.OleDLL/HRESULT/WINFUNCTYPE`） | ✅ 已修：专有成员 `getattr` 取 + 公开函数非 Windows 降级 + `is_supported()` | `PASM/desktop/audio.py` |
+| `sysops.py` 顶层 `ctypes.wintypes` 依赖 | ✅ 改用固定宽度等价类型（不再隐式依赖） | `PASM/desktop/sysops.py` |
+| 散落各处的 `os.startfile` / `explorer /select,` | ✅ 收敛进新模块，**15 处**已替换 | `PASM/desktop/platform_ops.py` |
+| Linux 构建（tar.gz + 可选 .deb） | ✅ 脚本就绪（**未在真机跑过**） | `PASM/desktop/build_linux.sh` |
+| macOS 构建（.app + .dmg） | ✅ 脚本就绪（**未在真机跑过**，且不做签名/公证） | `PASM/desktop/build_macos.sh` |
+| 三平台 CI | ✅ 工作流就绪（手动 / `desktop-v*` tag 触发） | `PASM/.github/workflows/build-desktop.yml` |
+
+验证方式（可证伪）：在进程内**屏蔽 `winreg` + 摘掉 Windows 专有 ctypes 成员 + 把 `sys.platform` 改成 `linux`**
+再导入 —— 修前必崩，修后 8/8 通过；还原平台后 `is_supported()` 变回 `True`（证明判据真在测平台分支）。
+另有 `platform_ops` 三平台模拟 17/17（Windows→`os.startfile` / macOS→`open -R` / Linux→`xdg-open`）。
+
+> ⚠️ **产物仍未产出**：两端 Release 附件依旧只有 Windows。原因不是代码，而是**没有 Linux/macOS 构建机或 CI 跑过**。
+> PyInstaller 不能交叉编译 —— 必须真跑一次那两条脚本（或让 CI 跑）。详见
+> `PASM/desktop/BUILD-CROSSPLATFORM.md`。
+
 ### 1.1 技术栈本身是跨平台的 ✅
 
 pasm-qclaw 技术底座是 **PySide6（Qt 6）+ PyInstaller**，两者都官方支持三平台：
