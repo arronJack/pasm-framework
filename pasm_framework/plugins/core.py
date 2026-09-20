@@ -52,7 +52,8 @@ class Message:
     字段分三类：
       · 输入（应用填写）：``role`` / ``text`` / ``session_id`` / ``user_id`` / ``meta``；
       · 插件可写的中间态：``facts``（检索到的知识） / ``reply``（助手回复） /
-        ``route_to``（指定走哪个能力）/ ``stop``（短路）/ ``error``（安全拦截原因）；
+        ``route_to``（指定走哪个能力）/ ``stop``（短路，仍走 ``on_reply_final`` 收尾）/
+        ``error``（安全拦截原因）；
       · 只读元信息：``created_at``。
     """
 
@@ -66,7 +67,8 @@ class Message:
     facts: List[Dict[str, Any]] = field(default_factory=list)
     reply: str = ""
     route_to: Optional[str] = None         # 指定走某个能力名（绕过关键词匹配）
-    stop: bool = False                     # 置 True 则跳过后续阶段（如安全拦截）
+    stop: bool = False                     # 置 True 则跳过能力路由与回复生成（如安全拦截）；
+                                           # 但仍会经过 on_reply_final 收尾（护栏必须对拦截文案生效）
     error: Optional[str] = None            # 安全/校验失败原因
 
     created_at: float = field(default_factory=time.time)

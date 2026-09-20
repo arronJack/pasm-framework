@@ -48,7 +48,7 @@ python -m pasm_framework doctor     # 确认环境没问题
 ```
 用户输入
   │
-  ├─1 on_message_in   安全扫描 / 会话绑定     ← stop 就短路返回
+  ├─1 on_message_in   安全扫描 / 会话绑定     ← stop 则跳过能力路由与回复生成
   ├─2 能力路由        命中 Capability 就执行
   ├─3 on_retrieve     插件贡献资料（知识库检索）→ 合并进 msg.facts
   ├─4 on_reply        生成（LLM 在此产出；模板兜底在后面）
