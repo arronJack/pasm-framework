@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pasm-framework"
+version = "0.1.0"
+description = "PASM 应用开发框架 —— 产品智能体/应用与认知引擎之间的防腐层（V1↔V2 唯一变动点）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "arronzheng" }]
+keywords = [
+    "pasm", "agent", "application-framework", "anti-corruption-layer",
+    "cognitive", "capability", "skill", "domain-adapter",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# 依赖基座（SDK / 认知后端协议），不依赖具体引擎
+dependencies = ["pasm-skills>=0.5.1"]
+
+[project.urls]
+Homepage = "https://gitee.com/arronzheng/pasm-framework"
+Repository = "https://github.com/arronJack/pasm-framework"
+Source = "https://gitee.com/arronzheng/pasm-framework"
+Issues = "https://gitee.com/arronzheng/pasm-framework/issues"
+
+[project.scripts]
+pasm-framework = "pasm_framework.__main__:main"
+
+[tool.setuptools]
+packages = ["pasm_framework"]
+
+[tool.setuptools.package-data]
+pasm_framework = ["py.typed"]
