@@ -2,6 +2,65 @@
 
 本文件记录 pasm-framework 的重要变更。
 
+## [0.3.0] — 2026-09-20
+
+补齐能力矩阵复检中列出的两个 **P0 缺口**：流式输出、多轮工具调用。
+
+### 新增：真流式输出（SSE）
+
+- `Message.stream_sink`：生成类插件可把逐块结果实时外推。
+- `BaseApplication.stream(text, …)`：产出事件字典
+  （`delta` / `replace` / `done` / `error`），供 SSE / WebSocket 下发。
+- `POST /api/chat/stream`：`text/event-stream`，零依赖
+  （`Connection: close` + EOF 结束流，不依赖 chunked）。
+- 内置 Widget 改用流式；Python / Node 客户端新增 `chat_stream` / `chatStream`。
+- **护栏不会被流式绕过**：流式是在*生成中*外推的，而 `on_reply_final` 在*生成后*才跑。
+  若收尾改写了内容（如脱敏），框架补发 **`replace` 事件**让客户端整条替换 ——
+  「唯一出口」承诺因此对两条入口（`handle` / `stream`）同时成立。
+- `handle()` 与 `stream()` 共用**同一个 `_run()`**，杜绝两条管线行为漂移。
+
+### 新增：多轮工具调用（Function Calling）
+
+- 应用的 `Capability` 自动暴露为 OpenAI 兼容 `tools`；
+  中文能力名会转成合法 tool 名（`cap_1`…），原名保留在 `description` 里。
+- 完整环：`tool_calls → 本地执行能力 → 回填 role=tool → 再请求`，
+  轮数由 `max_tool_rounds` 控制（默认 3）。
+- 流式下按 `index` 拼装 `delta.tool_calls` 增量。
+- **自动降级**：上游对 `tools` / `stream` 返回 400 时，改纯对话重试一次，不会挂。
+
+### 修复
+
+- **`_render_reply` 参数名陷阱**：基座 sdk 用关键字传参，子类必须把参数名
+  一字不差写成 `text/facts/mood`，否则运行时才炸 `TypeError`。
+  `BaseApplication.chat` 改为**按位置传参**，任意参数名都能工作。
+- **知识摄取入口三套名字、且失败静默**：`SimpleApplication.teach` /
+  `CustomerServiceAgent.ingest_faq` / 插件 `ingest` 各叫各的，且未启用知识库时
+  **静默返回 0**（"我喂了资料为什么答不上来"最难查）。
+  现统一为 `BaseApplication.ingest()`，另两个名字降级为别名；
+  未启用 `knowledge_base` 时**显式抛 `FrameworkError`** 并给出开启方法。
+
+### 全量代码检测（静态分析）
+
+- `pyflakes` 全仓扫描并清理：移除 4 处未用导入（`dataclasses.field` /
+  `typing.Any` / `typing.List` / `BackendConfig`）、1 处死代码
+  （`CapabilityDiscovery.match` 里算了却没用到的 `head`）、1 处未用导入
+  （`web_gateway` 的 `Message`）。仅保留 2 处**刻意的**可选依赖探测导入
+  （`pasm_skills` / `pyyaml`，均带 `noqa`）。
+- 文档内链 44 处全部可解析；依赖方向核查无反向依赖（不依赖 `pasm_agents`）、
+  无 `pasm.cognitive` 越层引用；敏感信息扫描无硬编码凭据。
+
+### 文档
+
+- `docs/openapi.yaml` 增补 `/api/chat/stream`（含事件流 schema）。
+- 教程 05 / 06 补流式与工具调用；教程 04 补"摄取入口统一"说明；
+  能力矩阵文档更新 P0 状态。
+
+### 工程
+
+- selftest 36 项 → **47 项**（流式事件序列、tool 名转换、SSE 帧解析、
+  Widget 流式、统一摄取入口与显式失败）。
+- 四套守门全绿；`CognitiveBackend` 协议与 `CognitiveAssembler` 唯一变动点零改动。
+
 ## [0.2.1] — 2026-09-20
 
 ### 修复：真实缺陷（均已配可证伪的反例测试）

@@ -171,6 +171,19 @@ c = PasmClient("http://127.0.0.1:8080", "your-secret")
 print(c.chat("怎么退货？", session_id="user-1"))
 ```
 
+流式（v0.3.0）：
+
+```python
+acc = ""
+for ev in c.chat_stream("怎么退货？", session_id="user-1"):
+    if ev["type"] == "delta":
+        acc += ev["text"]; print(ev["text"], end="", flush=True)
+    elif ev["type"] == "replace":      # 护栏改写过 → 整条替换
+        acc = ev["text"]
+```
+
+Node 侧同样：`for await (const ev of c.chatStream("你好")) { … }`。
+
 ## 9. 各语言的"最低接入成本"
 
 | 语言 | 需要写多少 | 说明 |
@@ -185,8 +198,8 @@ print(c.chat("怎么退货？", session_id="user-1"))
 
 | 语言 | 状态 |
 | --- | --- |
-| **Python** | ✅ 已在本机对真实服务端跑通（chat / ingest / kbStats / 401 映射） |
-| **Node.js** | ✅ 已在本机对真实服务端跑通（chat / ingest / kbStats / 401 映射） |
+| **Python** | ✅ 已在本机对真实服务端跑通（chat / **chat_stream 流式** / ingest / kbStats / 401 映射） |
+| **Node.js** | ✅ 已在本机对真实服务端跑通（chat / **chatStream 流式** / ingest / kbStats / 401 映射） |
 | C# | ⚠️ 代码已写，**本机无 .NET SDK，未做真机验证** |
 | Java | ⚠️ 代码已写，**本机无 JDK，未做真机验证** |
 | PHP | ⚠️ 代码已写，**本机无 PHP，未做真机验证** |

@@ -73,6 +73,60 @@ class PasmClient {
     return r.reply || "";
   }
 
+  /**
+   * 流式发送，逐条产出事件对象（async generator）。
+   *
+   * 事件：{type:"delta",text} / {type:"replace",text} / {type:"done"} / {type:"error"}
+   *
+   * 用法：
+   *   let acc = "";
+   *   for await (const ev of c.chatStream("你好")) {
+   *     if (ev.type === "delta") { acc += ev.text; process.stdout.write(ev.text); }
+   *     else if (ev.type === "replace") acc = ev.text;   // 护栏改写过 → 整条替换
+   *   }
+   */
+  async *chatStream(text, { sessionId = "default", userId = null, meta = null } = {}) {
+    const payload = { text, session_id: sessionId };
+    if (userId !== null) payload.user_id = userId;
+    if (meta !== null) payload.meta = meta;
+    const headers = { "Content-Type": "application/json", Accept: "text/event-stream" };
+    if (this.token) headers.Authorization = "Bearer " + this.token;
+
+    let resp;
+    try {
+      resp = await fetch(this.baseUrl + "/api/chat/stream", {
+        method: "POST", headers, body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      throw new PasmError(
+        `无法连接 pasm-framework 服务：${err.message}`, 0,
+        "确认服务已启动、地址与端口正确");
+    }
+    if (!resp.ok) {
+      const raw = await resp.text();
+      let obj = {};
+      try { obj = JSON.parse(raw); } catch { obj = { error: raw.slice(0, 200) }; }
+      throw new PasmError(obj.error || "请求失败", resp.status, obj.hint || "");
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop() || "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        const chunk = line.slice(5).trim();
+        if (!chunk) continue;
+        try { yield JSON.parse(chunk); } catch { /* 跳过坏帧 */ }
+      }
+    }
+  }
+
   /** 批量写入资料库，返回新增条数（需服务端启用 knowledge_base） */
   async ingest(items) {
     const r = await this._request("POST", "/api/ingest", { items });

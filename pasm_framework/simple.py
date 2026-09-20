@@ -32,7 +32,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 
 from .application import BaseApplication
-from .config import BackendConfig, load
+from .config import load
 from .discovery import Capability
 
 #: ``reply`` 回调签名：``(text, facts, mood) -> str``
@@ -166,8 +166,9 @@ class SimpleApplication(BaseApplication):
         return self.handle(text, session_id=session_id, user_id=user_id)
 
     def teach(self, items: List[Dict[str, Any]]) -> int:
-        """把资料喂进知识库（需启用 ``knowledge_base``）。返回新增条数。"""
-        kb = self.plugins.get("knowledge_base")
-        if kb is None or not self.plugins.is_enabled("knowledge_base"):
-            return 0
-        return kb.ingest(items)
+        """``ingest`` 的语义化别名（喂资料给知识库，返回新增条数）。
+
+        两个名字等价，统一由 ``BaseApplication.ingest`` 实现；未启用
+        ``knowledge_base`` 时会抛 ``FrameworkError`` 指引开启方式。
+        """
+        return self.ingest(items)

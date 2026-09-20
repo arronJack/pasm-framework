@@ -20,10 +20,45 @@ PASM V1 → V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。�
 | `CognitiveAssembler` / `CognitiveService` | 引擎 ↔ 应用装配（**V1↔V2 唯一变动点**） |
 | `DomainAdapter` | 领域知识 / 规则注入契约 |
 | `CapabilityDiscovery` / `Capability` | 能力声明与统一发现 |
-| `BaseApplication` | 通用 AI 应用底座（建在 `BaseAgent` 上） |
+| `BaseApplication` | 通用 AI 应用底座（建在 `BaseAgent` 上）；`handle()` / **`stream()`** / **`ingest()`** |
+| `SimpleApplication` / `@capability` | 3 行起步的极简应用写法（v0.2.1） |
 | `BaseSkill` / `SkillManifest` | 技能包代码化底座 |
 
 `CognitiveBackend` 协议的**单一真相源仍在基座** `pasm_skills.sdk.backend`，本包只做重导出。
+
+## 流式与工具调用（v0.3.0 新增）
+
+**真流式（SSE）** —— `stream()` 与 `handle()` **共用同一条管线**，不会行为漂移：
+
+```python
+for ev in app.stream("怎么退货？", session_id="u1"):
+    if ev["type"] == "delta":      # 增量片段，可直接追加显示
+        print(ev["text"], end="", flush=True)
+    elif ev["type"] == "replace":  # 护栏/润色改写过 → 整条替换
+        print("\n[已修正]", ev["text"])
+```
+
+网关侧对应 `POST /api/chat/stream`（`text/event-stream`，零依赖）；
+客户端有 `PasmClient.chat_stream()`（Python）与 `chatStream()`（Node）。
+
+> **护栏不会被流式绕过**：流式是在*生成中*外推的，而护栏在*生成后*才跑。
+> 若收尾改写了内容（例如脱敏），框架补发 `replace` 事件让客户端纠正 ——
+> 所以"唯一出口"承诺对 `handle` 和 `stream` 同时成立。
+
+**多轮工具调用** —— 应用的 `Capability` 自动暴露为 OpenAI 兼容 `tools`：
+
+```python
+app = BaseApplication(..., backend_config={
+    "llm_responder": {"enabled": True, "config": {
+        "provider": "deepseek", "api_key": "...",
+        "tools": True,           # 把能力交给模型调用（默认开）
+        "max_tool_rounds": 3,    # 工具环上限
+    }}})
+```
+
+模型说"要调 `cap_1`" → 框架真的执行该能力 → 结果回填 `role=tool` → 再请求。
+中文能力名会转成合法 tool 名（`cap_1`…），原名保留在 `description` 里。
+上游对 `tools` / `stream` 返回 400 时**自动降级**为纯对话重试，不会挂。
 
 ## 插件库（v0.2.0 新增，即插即用）
 
@@ -195,7 +230,8 @@ print(app.handle("你好"))          # → "reply:你好"（回落 chat）
 ## 快速自检
 
 ```bash
-python -m pasm_framework selftest      # 36 项
+python -m pasm_framework selftest      # 44 项
+python -m pasm_framework doctor        # 真装配一遍插件并报拼错的名字
 python -m pasm_framework version
 ```
 

@@ -91,7 +91,7 @@ def _cmd_doctor(_args) -> int:
     line(True, "pasm-framework %s" % __version__)
 
     try:
-        from .plugins.registry import builtin_plugins, default_config
+        from .plugins.registry import builtin_plugins
         n = len(builtin_plugins())
         line(n >= 7, "内置插件 %d 个可加载" % n, "重装 pasm-framework")
     except Exception as ex:  # noqa: BLE001

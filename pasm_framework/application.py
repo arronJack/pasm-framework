@@ -19,8 +19,10 @@
 """
 from __future__ import annotations
 
+import queue
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 from pasm_skills.sdk.base import BaseAgent
 from pasm_skills.sdk.backend import CognitiveBackend
@@ -152,21 +154,30 @@ class BaseApplication(BaseAgent):
             brief=text, tags=[text[:4]] if text else [],
             salience=2, category="对话",
         )
-        return self._render_reply(text=text, facts=f, mood=mood)
+        # 位置传参（而非 text=/facts=/mood=）：基座 sdk 用的是关键字传参，
+        # 于是子类必须把参数名一字不差地写成 text/facts/mood，否则运行时
+        # 才炸 TypeError —— 对使用者太不友好。这里放宽为按位置传，
+        # 任何参数名都能工作（签名顺序仍是 text, facts, mood）。
+        return self._render_reply(text, f, mood)
 
     # ---- 统一入口：插件链 + 能力路由 → 回落 chat --------------
-    def handle(
+    def _run(
         self,
         text: str,
         *,
         session_id: str = "default",
         user_id: Optional[str] = None,
         meta: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """处理用户输入的统一入口（插件增强版）。
+        stream_sink: Optional[Callable[[str], None]] = None,
+    ) -> Message:
+        """跑完整插件管线并返回终态 ``Message``（``handle`` / ``stream`` 共用）。
+
+        抽出来的理由：``handle``（一次性返回）与 ``stream``（流式返回）
+        必须是**同一条路径** —— 否则"唯一出口"承诺会在流式上失效
+        （护栏只覆盖其中一条）。
 
         管线：
-          1. ``on_message_in``   安全扫描 / 会话绑定 / 语言；``stop`` 则短路返回；
+          1. ``on_message_in``   安全扫描 / 会话绑定 / 语言；``stop`` 则跳过生成；
           2. 能力路由：命中 ``Capability`` → 执行（动作类优先）；
           3. ``on_retrieve``     插件贡献资料（如知识库）→ 合并进 ``msg.facts``；
           4. 回复生成：能力未命中时跑 ``on_reply``（LLM）→ 否则回落 ``chat``；
@@ -175,11 +186,11 @@ class BaseApplication(BaseAgent):
 
         「唯一出口」的含义：无论回复来自能力 / LLM / 模板兜底 / 被拦截，
         出站前都必然经过 ``on_reply_final``。护栏因此不可能被某条路径绕过。
-
-        不启用任何插件时，行为与 v0.1.0 完全一致（能力路由 → 回落 chat）。
         """
         msg = Message(role="user", text=text, session_id=session_id,
                       user_id=user_id, meta=meta or {})
+        if stream_sink is not None:
+            msg.stream_sink = stream_sink
         ctx = PluginContext(self, msg, {})
 
         # 1. 入站预处理
@@ -190,7 +201,7 @@ class BaseApplication(BaseAgent):
             if not msg.reply:
                 msg.reply = "(已被安全策略拦截)"
             self.plugins.run_hooks("on_reply_final", ctx)
-            return msg.reply
+            return msg
 
         # 2. 能力路由（动作类显式触发优先）
         cap = None
@@ -242,7 +253,118 @@ class BaseApplication(BaseAgent):
 
         # 5. 学习 / 落地
         self.plugins.run_hooks("on_learn", ctx)
-        return reply
+        return msg
+
+    def handle(
+        self,
+        text: str,
+        *,
+        session_id: str = "default",
+        user_id: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """处理用户输入的统一入口（一次性返回完整回复）。
+
+        不启用任何插件时，行为与 v0.1.0 完全一致（能力路由 → 回落 chat）。
+        需要逐字上屏请用 :meth:`stream`。
+        """
+        return self._run(text, session_id=session_id, user_id=user_id,
+                         meta=meta).reply or ""
+
+    # ---- 流式入口（SSE 数据源）---------------------------------
+    def stream(
+        self,
+        text: str,
+        *,
+        session_id: str = "default",
+        user_id: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """流式处理：产出事件字典，供 SSE / WebSocket 逐条下发。
+
+        事件类型
+        --------
+          · ``{"type": "delta",   "text": "..."}``   增量片段（可直接追加显示）
+          · ``{"type": "replace", "text": "全文"}``  护栏/润色改写过内容时下发，
+                                                     客户端应**替换**整条回复
+          · ``{"type": "done",    "session_id": ..., "chars": N}``
+          · ``{"type": "error",   "error": "..."}``
+
+        为什么需要 ``replace``：流式是在**生成中**把片段推给客户端的，
+        而护栏（``on_reply_final``）在**生成后**才跑。若收尾阶段改写了内容
+        （例如脱敏），已经流出去的片段就不等于最终文本 —— 此时补发
+        ``replace`` 让客户端纠正，护栏因此**不会被流式绕过**。
+
+        管线与 :meth:`handle` **完全相同**（同一个 ``_run``），
+        区别只是多了 ``stream_sink``，让生成类插件（如 LLM）能逐块外推。
+        """
+        q: "queue.Queue" = queue.Queue()
+        _END = object()
+        box: Dict[str, Any] = {}
+
+        def sink(chunk: str) -> None:
+            if chunk:
+                q.put(chunk)
+
+        def work() -> None:
+            try:
+                box["msg"] = self._run(
+                    text, session_id=session_id, user_id=user_id,
+                    meta=meta, stream_sink=sink,
+                )
+            except Exception as ex:                      # noqa: BLE001
+                box["error"] = str(ex)
+            finally:
+                q.put(_END)
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        streamed: List[str] = []
+        while True:
+            item = q.get()
+            if item is _END:
+                break
+            streamed.append(item)
+            yield {"type": "delta", "text": item}
+
+        if "error" in box:
+            yield {"type": "error", "error": box["error"]}
+            return
+
+        msg: Message = box["msg"]
+        final = msg.reply or ""
+        acc = "".join(streamed)
+        if acc and final != acc:
+            # 收尾阶段改写了内容（脱敏/润色）→ 让客户端整条替换。
+            yield {"type": "replace", "text": final}
+        elif not acc and final:
+            # 没走流式（能力命中 / 模板兜底 / 被拦截）→ 整块下发。
+            yield {"type": "delta", "text": final}
+        yield {"type": "done", "session_id": msg.session_id, "chars": len(final)}
+
+    # ---- 知识摄取（资料库）------------------------------------
+    def ingest(self, items: List[Dict[str, Any]]) -> int:
+        """把资料写进知识库，返回新增条数（需启用 ``knowledge_base`` 插件）。
+
+        这是**应用级统一入口**，与 REST 的 ``POST /api/ingest`` 同名同义：
+        站点 FAQ / 产品文档 / 历史工单都从这里进来，形成资料库并参与检索与
+        「自学」（``on_learn`` 会把优质问答回沉）。
+
+        ``SimpleApplication.teach`` 与 ``CustomerServiceAgent.ingest_faq``
+        都是本方法的别名 —— 三个名字一个含义，统一先认 ``ingest``。
+
+        未启用知识库时**抛错而不是静默返回 0**：否则「我明明喂了资料，为什么
+        答不上来」会成为最难查的一类问题。
+        """
+        kb = self.plugins.get("knowledge_base")
+        if kb is None or not self.plugins.is_enabled("knowledge_base"):
+            from .errors import FrameworkError
+            raise FrameworkError(
+                "ingest() 需要启用 'knowledge_base' 插件：backend_config 里设 "
+                "{'knowledge_base': {'enabled': True, 'config': {'kb_dir': '...'}}}"
+            )
+        return kb.ingest(items)
 
     # ---- 插件指标 / 健康 --------------------------------------
     def plugin_metrics(self) -> Dict[str, Any]:

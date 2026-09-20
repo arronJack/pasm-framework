@@ -18,8 +18,8 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple  # noqa: F401
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 # 默认只匹配句首这么多字符——产品侧有意保留（防止长句里误命中）。
@@ -80,7 +80,6 @@ class CapabilityDiscovery:
         t = (text or "").strip()
         if not t:
             return None
-        head = t[:DEFAULT_HEAD_CHARS]
         for cap in self._caps.values():
             if cap.predicate is not None and cap.predicate(t):
                 return cap

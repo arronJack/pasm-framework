@@ -71,6 +71,12 @@ class Message:
                                            # 但仍会经过 on_reply_final 收尾（护栏必须对拦截文案生效）
     error: Optional[str] = None            # 安全/校验失败原因
 
+    #: 流式增量出口（v0.3.0）。非 ``None`` 时，"生成"类插件可以把逐块结果实时推给调用方；
+    #: 同时**仍必须**把完整文本写进 ``reply`` —— 因为 ``on_reply_final`` 收尾阶段
+    #: 只能看到 ``reply``。二者不一致时，``BaseApplication.stream`` 会补发
+    #: ``replace`` 事件纠正下游（护栏才不会被流式绕过）。
+    stream_sink: Optional[Callable[[str], None]] = None
+
     created_at: float = field(default_factory=time.time)
 
     def add_fact(self, fact: Dict[str, Any]) -> None:

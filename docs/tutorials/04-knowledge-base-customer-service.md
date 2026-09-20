@@ -16,6 +16,12 @@
 | **高效** | 倒排索引检索 + 零 LLM 兜底 | 2 万条资料检索 3.2ms（实测） |
 | **安全** | `safety` | 注入拦截 + 出站脱敏 |
 
+> **喂资料只有一个入口**：`app.ingest(items)`。`SimpleApplication.teach()` 与
+> `CustomerServiceAgent.ingest_faq()` 都只是它的别名，三处叫法等价。
+> 未启用 `knowledge_base` 时 `ingest()` 会**显式抛错**（不会静默吞），
+> 避免"我明明喂了资料，为什么答不上来"。
+> 通过 HTTP 可以用 `POST /api/ingest`，语义完全相同。
+
 ## 2. 完整实现
 
 ```python
@@ -29,7 +35,7 @@ class CustomerService(SimpleApplication):
 
     def ingest_faq(self, items):
         """从 CMS / 帮助中心 / 数据库同步资料。"""
-        return self.teach(items)
+        return self.ingest(items)          # ingest / teach 是同一个入口
 
 
 def build(kb_dir="./kb"):

@@ -91,6 +91,62 @@ class PasmClient:
             payload["meta"] = meta
         return self._request("POST", "/api/chat", payload).get("reply", "")
 
+    def chat_stream(self, text: str, session_id: str = "default",
+                    user_id: Optional[str] = None,
+                    meta: Optional[Dict[str, Any]] = None):
+        """流式发送，逐条产出事件字典。
+
+        事件：``{"type":"delta","text":…}`` / ``{"type":"replace","text":…}`` /
+        ``{"type":"done",…}`` / ``{"type":"error",…}``。
+
+        用法::
+
+            acc = ""
+            for ev in c.chat_stream("你好"):
+                if ev["type"] == "delta":
+                    acc += ev["text"]; print(ev["text"], end="", flush=True)
+                elif ev["type"] == "replace":     # 护栏改写过内容 → 整条替换
+                    acc = ev["text"]
+        """
+        payload: Dict[str, Any] = {"text": text, "session_id": session_id}
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if meta is not None:
+            payload["meta"] = meta
+        url = self.base_url + "/api/chat/stream"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json",
+                   "Accept": "text/event-stream"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as ex:
+            raw = ex.read().decode("utf-8", "ignore") or "{}"
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                obj = {"error": raw[:200]}
+            raise PasmError(obj.get("error", "请求失败"), ex.code,
+                            obj.get("hint", "")) from ex
+        except urllib.error.URLError as ex:
+            raise PasmError("无法连接 pasm-framework 服务：%s" % ex.reason, 0,
+                            "确认服务已启动、地址与端口正确") from ex
+        # 逐行读 SSE（服务端以 EOF 结束流，不用 Content-Length）。
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if not chunk:
+                    continue
+                try:
+                    yield json.loads(chunk)
+                except Exception:
+                    continue
+
     def ingest(self, items: List[Dict[str, Any]]) -> int:
         """批量写入资料库，返回新增条数（需服务端启用 knowledge_base）。"""
         return int(self._request("POST", "/api/ingest", {"items": items})

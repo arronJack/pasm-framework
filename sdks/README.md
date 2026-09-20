@@ -25,6 +25,11 @@ torch/numpy 生态；把它翻译成 C#/Java/PHP 既不现实也没有必要。
 每个客户端覆盖：`chat` / `ingest` / `health` / `kb_stats`，并把
 `401 / 409 / 413 / 429` 映射成语义化异常（而不是让你去判断状态码）。
 
+**流式**（v0.3.0）：Python 有 `chat_stream()`、Node 有 `chatStream()`，
+逐条产出 `delta` / `replace` / `done` / `error` 事件。
+其余语言接 `POST /api/chat/stream` 即可（SSE 文本流，任何语言十行内可解析）。
+`replace` 必须处理 —— 它是护栏改写内容后的纠正通知。
+
 ## 先起服务
 
 ```bash

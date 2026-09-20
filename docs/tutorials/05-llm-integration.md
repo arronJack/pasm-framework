@@ -121,6 +121,71 @@ PASM_LLM_PROVIDER=ollama PASM_LLM_MODEL=qwen2.5:7b python main.py
 `llm_responder` 对 Ollama 走 `/api/chat`，对 OpenAI 兼容端点走 `/chat/completions`，
 自动区分响应格式。
 
+## 8. 流式输出（v0.3.0）
+
+首字延迟从"整段生成完"降到"首个 token"。**服务端侧只需要开开关**：
+
+```python
+"llm_responder": {"enabled": True, "config": {
+    "provider": "deepseek", "api_key": "...",
+    "stream": True,          # 默认就是 True
+}}
+```
+
+消费端用 `app.stream()`（`handle` 的流式版，**同一条管线**）：
+
+```python
+acc = ""
+for ev in app.stream("帮我讲讲退货规则", session_id="u1"):
+    if ev["type"] == "delta":
+        acc += ev["text"]
+        print(ev["text"], end="", flush=True)
+    elif ev["type"] == "replace":
+        # 护栏/润色改写过内容 —— 丢掉已显示的部分，整条替换
+        acc = ev["text"]
+        print("\r" + acc)
+```
+
+> **为什么会有 `replace`**：`delta` 是在*生成中*推出去的，而护栏
+> （`on_reply_final`）在*生成后*才跑。若收尾把手机号脱敏了，前面流出去的片段
+> 就不是最终文本 —— 框架补发 `replace` 让客户端纠正。
+> **护栏因此不会被流式绕过**，这是 `stream()` 与 `handle()` 共用一个出口的直接结果。
+
+## 9. 多轮工具调用（Function Calling，v0.3.0）
+
+应用的每个 `Capability` 会自动变成模型可调用的工具：
+
+```python
+class Shop(SimpleApplication):
+    @capability(keywords=("订单", "查单"), description="按订单号查询物流状态")
+    def track(self, text):
+        return call_my_backend(text)          # 你自己的业务逻辑
+```
+
+```python
+app = Shop("shop", {"name": "小智"}, backend_config=load(preset_name="chatbot", llm_responder={
+    "enabled": True,
+    "config": {"provider": "deepseek", "api_key": "...",
+               "tools": True,            # 默认 True
+               "max_tool_rounds": 3}}))
+```
+
+运行过程（框架自动完成，你什么都不用写）：
+
+```
+用户："我那单到哪了"
+  → 请求 1（带 tools）→ 模型回 tool_calls: cap_1({"text": "我那单到哪了"})
+  → 框架执行 Shop.track(...)  ← 真的跑了你的业务逻辑
+  → 请求 2（带 role=tool 的结果）→ 模型产出最终自然语言回复
+```
+
+两个实现细节值得知道：
+
+- **中文能力名不合法**（OpenAI 要求 `^[a-zA-Z0-9_-]{1,64}$`），框架会转成
+  `cap_1`、`cap_2`…，而把中文原名写进工具的 `description`，模型照样选得对。
+- **上游不支持就降级**：若服务端对 `tools`（或 `stream`）返回 400，
+  框架自动去掉该参数重试一次，业务不受影响。
+
 ## 验证
 
 **用假服务端确认请求真的打到了正确路径**（别只看"有回复"就以为通了）：

@@ -116,11 +116,8 @@ class CustomerServiceAgent(BaseApplication):
 
     # —— 业务便捷方法 ——
     def ingest_faq(self, items: List[Dict[str, Any]]) -> int:
-        """把站点 FAQ / 文档喂进资料库（一次即可，持久化）。"""
-        kb = self.plugins.get("knowledge_base")
-        if kb is None:
-            return 0
-        return kb.ingest(items)
+        """把站点 FAQ / 文档喂进资料库（``ingest`` 的别名，一次即可、会落盘）。"""
+        return self.ingest(items)
 
     def ask(
         self, text: str, session_id: str = "default",

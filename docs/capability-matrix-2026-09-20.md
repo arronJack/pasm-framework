@@ -8,7 +8,7 @@
 ## 0. 一句话结论
 
 **能做**：站点/平台 AI 应用、智能客服、内部工具类 APP、有性格的游戏 NPC、桌面端"大脑服务"。
-**暂时不能"开箱"直接做**：需要多端原生 UI 的完整 APP、高并发公网服务、需要 token 级流式输出的产品。
+**暂时不能"开箱"直接做**：需要多端原生 UI 的完整 APP、高并发公网服务。
 **不建议做**：用它替代游戏引擎（渲染/物理/帧循环），或替代 Web 框架做常规 CRUD。
 
 关键判断依据是这一条：**pasm-framework 是「认知大脑 + 应用装配层」，不是「UI/渲染/传输框架」。**
@@ -34,7 +34,7 @@ PySide6 / Flutter / Unity / 浏览器 / 反向代理，框架通过 HTTP 或进�
 | 游戏 NPC（战斗/寻路/动画） | ❌ | — | 请用 Unity/Unreal/Godot；本框架只做"人格与记忆"层 | 不适用 |
 | 完整 CRUD 业务系统 | ❌ | — | Django/FastAPI/Spring；本框架不做路由/ORM/模板 | 不适用 |
 | 高并发公网 API | 🔶 | 零依赖 HTTP 网关（标准库） | 前置 Nginx/Caddy 做 TLS、连接池、限流 | 小（运维层） |
-| 流式对话体验 | ❌ | — | 需实现 SSE/WebSocket + LLM 流式解析（见 §5 P1-1） | 中 |
+| 流式对话体验 | ✅ | SSE：`POST /api/chat/stream` + `app.stream()` | 已落地（v0.3.0），含 `replace` 纠正语义 | — |
 | 私有化 / 断网部署 | ✅ | 零外部依赖，不用 LLM 也能"就资料作答" | 无 | — |
 | 多语言技术栈 | 🔶 | HTTP/JSON 契约 + 5 语言参考客户端 | 各语言按需自行封装（见 `polyglot-strategy.md`） | 小 |
 
@@ -141,12 +141,13 @@ CPython 对 str 的 `hash` 带每进程随机盐（PYTHONHASHSEED），同一句
 
 ## 5. 仍然存在的问题（按优先级）
 
-### P0 —— 影响"能上线"的，建议下一个版本做
+### P0 —— 影响"能上线"的
 
-1. **无流式输出（SSE / WebSocket）**
-   现状：`/api/chat` 一次性返回，LLM 长回复要等完整生成。
-   影响：用户感知延迟高（这也是你反馈过的"对话回复慢"的体验侧根因之一）。
-   建议：`llm_responder` 支持 `stream=True` 逐块读 + 网关加 `GET /api/chat/stream`（SSE）。
+1. ~~**无流式输出（SSE / WebSocket）**~~ → **v0.3.0 已解决** ✅
+   `Message.stream_sink` + `BaseApplication.stream()`（与 `handle` 共用同一条 `_run` 管线）+
+   `POST /api/chat/stream`（SSE，零依赖）+ Widget 流式 + SDK `chat_stream`/`chatStream`。
+   护栏不会被流式绕过：收尾改写过内容时补发 `replace` 事件让客户端整条替换。
+   同时补上了**多轮工具调用**（`Capability` → OpenAI 兼容 `tools`，含中文能力名转换与 400 降级）。
 
 2. **资料库无持久化向量检索 / 无语义召回**
    现状：关键词 + 中文 bigram。已发现真实局限：问"多久**发货**"对 FAQ 写"24 小时内**发出**"
@@ -166,7 +167,8 @@ CPython 对 str 的 `hash` 带每进程随机盐（PYTHONHASHSEED），同一句
 
 ### P1 —— 提升体验与工程化
 
-1. **无真实流式的对话 UI**（Widget 是一次性 fetch）。
+1. ~~**无真实流式的对话 UI**（Widget 是一次性 fetch）~~ → **v0.3.0 已解决** ✅
+   Widget 与两个 SDK 客户端都已改用 `POST /api/chat/stream` 并正确处理 `replace`。
 2. **LLM 回复无重试 / 无超时分级 / 无多模型回退**：目前失败即回落模板。
    建议：`llm_responder` 支持 `fallbacks: [模型A, 模型B]`、指数退避。
 3. **`sessions` 历史仅内存**：进程重启会话全丢。建议按 `session_id` 落盘可选开启。

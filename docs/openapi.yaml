@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: pasm-framework Gateway API
-  version: 0.2.1
+  version: 0.3.0
   description: |
     pasm-framework 的 HTTP 契约（**单一真相源**）。
 
@@ -32,25 +32,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [text]
-              properties:
-                text:
-                  type: string
-                  description: 用户输入
-                  example: 怎么退货？
-                session_id:
-                  type: string
-                  default: default
-                  description: 会话标识；不同 session 之间的历史互相隔离
-                user_id:
-                  type: string
-                  nullable: true
-                  description: 用户标识（用于租户/个性化，当前版本仅记录）
-                meta:
-                  type: object
-                  additionalProperties: true
-                  description: 透传给插件的附加信息
+              $ref: "#/components/schemas/ChatRequest"
       responses:
         "200":
           description: 成功
@@ -64,6 +46,62 @@ paths:
               example:
                 reply: 商品签收后 7 天内可无理由退货，需保持吊牌完整。
                 session_id: web-abc123
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+
+  /api/chat/stream:
+    post:
+      tags: [chat]
+      summary: 流式发送一条用户消息（SSE）
+      description: |
+        与 `/api/chat` 同入参，返回 `text/event-stream`。
+
+        每个事件是一行 `data: {json}`，事件之间以空行分隔：
+
+        | type | 含义 | 客户端动作 |
+        | --- | --- | --- |
+        | `delta` | 增量片段 | 追加到当前气泡 |
+        | `replace` | 全文（护栏/润色改写过内容） | **替换**整条回复 |
+        | `done` | 结束 | 收尾（带 `session_id` / `chars`） |
+        | `error` | 出错 | 提示用户 |
+
+        `replace` 存在的原因：流式是在*生成中*外推片段，而护栏
+        （`on_reply_final`）在*生成后*才跑；收尾若改写了文本，必须让客户端
+        纠正，否则护栏会被流式绕过。
+
+        流以 EOF 结束（服务端不发 `Content-Length`，改用 `Connection: close`）。
+      security:
+        - bearerAuth: []
+        - tokenHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                delta:
+                  value: |
+                    data: {"type":"delta","text":"商品签收后"}
+
+                replace:
+                  value: |
+                    data: {"type":"replace","text":"请联系 [手机号已脱敏] 处理。"}
+
+                done:
+                  value: |
+                    data: {"type":"done","session_id":"web-abc123","chars":42}
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -272,6 +310,27 @@ components:
       properties:
         error: { type: string }
         hint: { type: string }
+
+    ChatRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          description: 用户输入
+          example: 怎么退货？
+        session_id:
+          type: string
+          default: default
+          description: 会话标识；不同 session 之间的历史互相隔离
+        user_id:
+          type: string
+          nullable: true
+          description: 用户标识（用于租户/个性化，当前版本仅记录）
+        meta:
+          type: object
+          additionalProperties: true
+          description: 透传给插件的附加信息
 
   responses:
     BadRequest:

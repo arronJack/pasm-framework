@@ -39,7 +39,7 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
 """
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from .adapter import (  # noqa: F401
     DomainAdapter,
@@ -148,7 +148,7 @@ def selftest() -> bool:
         from . import (
             BaseApplication, Capability, CapabilityDiscovery,
             CognitiveAssembler, CognitiveService, DomainAdapter,
-            NullDomainAdapter, StaticDomainAdapter,
+            StaticDomainAdapter,
         )
         with tempfile.TemporaryDirectory() as td:
             # 装配器用 V1 默认路径装配出认知服务（core 优先、降级 light）。
@@ -224,6 +224,31 @@ def selftest() -> bool:
             facts = kb.recall("怎么退货", k=3)
             check(any("退货" in (f.get("brief") or "") for f in facts),
                   "knowledge_base.recall 命中退货政策")
+
+            # 应用级摄取入口统一：ingest == teach == ingest_faq
+            from .simple import SimpleApplication as _SA
+            _sa = _SA(
+                "sf-ingest", {"name": "自检"},
+                backend_config=BackendConfig(plugins={
+                    "knowledge_base": {"enabled": True,
+                                       "config": {"kb_dir": td + "/kb_ingest"}},
+                    "warmth": {"enabled": False, "config": {}},
+                }))
+            check(_sa.ingest([{"title": "发票", "content": "可开电子发票",
+                               "source": "faq"}]) == 1,
+                  "BaseApplication.ingest 统一摄取入口可用")
+            check(_sa.teach([{"title": "发货", "content": "24 小时发货",
+                              "source": "faq"}]) == 1,
+                  "SimpleApplication.teach 是 ingest 的别名")
+            # 未启用知识库时必须显式报错（静默返回 0 = 最难查的假失败）
+            _off = _SA("sf-off", {"name": "自检"},
+                       backend_config=BackendConfig(plugins={
+                           "knowledge_base": {"enabled": False, "config": {}}}))
+            try:
+                _off.ingest([{"title": "x", "content": "y"}])
+                check(False, "未启用知识库时 ingest 应显式报错")
+            except FrameworkError:
+                check(True, "未启用知识库时 ingest 显式报错（不静默返回 0）")
 
             # 安全：prompt 注入拦截（block 模式）
             block_cfg = BackendConfig(plugins={
@@ -424,6 +449,59 @@ def selftest() -> bool:
                   "脚手架 create 真正落盘")
             check(set(KINDS) >= {"app", "chatbot", "game_npc"},
                   "脚手架提供 3 种模板")
+
+            # ---- v0.3.0 流式（SSE 数据源）----
+            class _StreamApp(BaseApplication):
+                def action_pool(self):
+                    return ["a"]
+
+                def _render_reply(self, q, f, m):        # 故意换参数名
+                    return "流式模板:%s" % q
+
+            sapp = _StreamApp(
+                agent_id="_fw_stream", persona={"name": "p8"}, persist_dir=td,
+                capabilities=[Capability("报时", run=lambda a, t: "现在 12:00",
+                                         keywords=("报时",))],
+                backend_config=load(preset_name="minimal"),
+            )
+            evs = list(sapp.stream("报时"))
+            check([e["type"] for e in evs] == ["delta", "done"]
+                  and evs[0]["text"] == "现在 12:00",
+                  "stream() 的能力路径：整块 delta + done")
+            evs2 = list(sapp.stream("随便聊聊"))
+            check(evs2[-1]["type"] == "done"
+                  and "流式模板" in "".join(e.get("text", "") for e in evs2),
+                  "stream() 的模板路径也能收口")
+            check(sapp.handle("随便聊聊").startswith("流式模板"),
+                  "_render_reply 参数名不匹配也能工作（按位置传参）")
+
+            # ---- v0.3.0 工具调用（能力 → tools）----
+            from .plugins.builtins.llm_responder import (
+                LLMResponderPlugin, _iter_frames, _tool_name,
+            )
+            check(_tool_name("广告设计", 1) == "cap_1"
+                  and _tool_name("send_mail", 2) == "send_mail"
+                  and _tool_name("", 3) == "cap_3",
+                  "中文/空能力名被转成合法 tool 名")
+            calls = LLMResponderPlugin._finalize_calls(
+                {0: {"id": "c1", "name": "cap_1", "arguments": '{"text":"订海报"}'}})
+            check(calls and calls[0]["name"] == "cap_1"
+                  and calls[0]["args"] == {"text": "订海报"},
+                  "流式 tool_calls 增量被正确拼装")
+            import io as _io2
+            frames = list(_iter_frames(_io2.BytesIO(
+                b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                b': keep-alive\n\n'
+                b'data: [DONE]\n\n'), "openai"))
+            check(len(frames) == 1 and frames[0]["choices"][0]["delta"]["content"] == "a",
+                  "SSE 帧解析跳过注释与 [DONE]")
+
+            # ---- v0.3.0 网关流式接口 ----
+            from .plugins.builtins.web_gateway import _WIDGET_HTML, WebGatewayPlugin
+            check(hasattr(WebGatewayPlugin, "stream"),
+                  "web_gateway 提供 stream() 供 SSE 下发")
+            check("/api/chat/stream" in _WIDGET_HTML and "replace" in _WIDGET_HTML,
+                  "内置 Widget 已改用流式并处理 replace 纠正")
     except Exception as ex:                          # noqa: BLE001
         check(False, "应用开发框架表面可装配（异常：%s）" % ex)
 

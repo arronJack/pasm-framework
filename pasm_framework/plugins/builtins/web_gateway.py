@@ -7,6 +7,10 @@
 接口
 ----
   · ``POST /api/chat``            ``{text, session_id?, user_id?, meta?}`` → ``{reply, session_id}``
+  · ``POST /api/chat/stream``     同上入参，返回 **SSE**（``text/event-stream``）：
+                                  ``{"type":"delta","text":…}`` /
+                                  ``{"type":"replace","text":…}`` /
+                                  ``{"type":"done",…}`` / ``{"type":"error",…}``
   · ``POST /api/ingest``          ``{items:[{title,content,source?,tags?}]}`` → ``{added}``
   · ``POST /api/sessions/reset``  ``{session_id}`` → ``{ok}``
   · ``GET  /healthz``             健康 + 指标（来自 observability 插件）
@@ -33,7 +37,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-from ..core import BasePlugin, Message, PluginContext
+from ..core import BasePlugin, PluginContext
 
 # 模板里的 __TOKEN__ 会被替换为配置的令牌（未配置则留空 → 前端不带鉴权头）。
 _WIDGET_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -56,14 +60,27 @@ _WIDGET_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const SID='web-'+Math.random().toString(36).slice(2);
 const TOKEN='__TOKEN__';
+function LOG(){return document.getElementById('log')}
+function scroll(){LOG().scrollTop=1e9}
+function add(c,m){const d=document.createElement('div');d.className='msg '+c;d.textContent=m||'';
+LOG().appendChild(d);scroll();return d}
 async function send(){const t=document.getElementById('t');const v=t.value.trim();if(!v)return;
-add('u',v);t.value='';
+add('u',v);t.value='';const bubble=add('a','');
 const h={'Content-Type':'application/json'};if(TOKEN)h['Authorization']='Bearer '+TOKEN;
-try{const r=await fetch('/api/chat',{method:'POST',headers:h,
-body:JSON.stringify({text:v,session_id:SID})});const j=await r.json();
-add('a',j.reply||j.error||'(无回复)');}catch(e){add('a','网络异常，请稍后再试');}}
-function add(c,m){const d=document.createElement('div');d.className='msg '+c;d.textContent=m;
-document.getElementById('log').appendChild(d);document.getElementById('log').scrollTop=1e9;}
+try{
+const r=await fetch('/api/chat/stream',{method:'POST',headers:h,body:JSON.stringify({text:v,session_id:SID})});
+if(!r.ok||!r.body){const j=await r.json().catch(()=>({}));bubble.textContent=j.error||'(无回复)';return}
+const rd=r.body.getReader(),dec=new TextDecoder();let buf='',acc='';
+for(;;){const c=await rd.read();if(c.done)break;
+buf+=dec.decode(c.value,{stream:true});
+const parts=buf.split('\n\n');buf=parts.pop()||'';
+for(const p of parts){const line=p.trim();if(line.indexOf('data:')!==0)continue;
+let ev;try{ev=JSON.parse(line.slice(5).trim())}catch(e){continue}
+if(ev.type==='delta'){acc+=ev.text;bubble.textContent=acc;scroll()}
+else if(ev.type==='replace'){acc=ev.text;bubble.textContent=acc;scroll()}
+else if(ev.type==='error'){bubble.textContent='出错了：'+ev.error}}}
+if(!bubble.textContent)bubble.textContent='(无回复)';
+}catch(e){bubble.textContent='网络异常，请稍后再试'}}
 </script></body></html>"""
 
 
@@ -120,6 +137,27 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+    def _sse_start(self) -> None:
+        """开始 SSE 响应。
+
+        不用 ``Content-Length``（长度未知）—— 改发 ``Connection: close``
+        并置 ``close_connection``，让客户端以 EOF 判定流结束。
+        比 chunked 少一层编码，且所有 HTTP 客户端都认。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")   # 让 nginx 别缓冲
+        self._cors()
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _sse_send(self, obj: Dict[str, Any]) -> None:
+        payload = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+        self.wfile.write(payload.encode("utf-8"))
+        self.wfile.flush()
 
     def _client_ip(self) -> str:
         return (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -200,8 +238,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, gw.kb_stats())
         else:
             self._send(404, {"error": "not found", "paths": [
-                "/", "/widget", "/healthz", "/api/chat", "/api/ingest",
-                "/api/plugins", "/api/summary", "/api/kb/stats",
+                "/", "/widget", "/healthz", "/api/chat", "/api/chat/stream",
+                "/api/ingest", "/api/plugins", "/api/summary", "/api/kb/stats",
                 "/api/sessions/reset"]})
 
     def do_POST(self):  # noqa: N802
@@ -225,6 +263,27 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, {"reply": reply, "session_id": sid})
             except Exception as ex:  # noqa: BLE001
                 self._send(500, {"error": str(ex)})
+        elif path == "/api/chat/stream":
+            payload = self._read_json()
+            if payload is None:
+                return
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                self._send(400, {"error": "text required"})
+                return
+            sid = str(payload.get("session_id") or "default")
+            uid = payload.get("user_id")
+            meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else None
+            self._sse_start()
+            try:
+                for ev in gw.stream(text, session_id=sid, user_id=uid, meta=meta):
+                    self._sse_send(ev)
+            except Exception as ex:  # noqa: BLE001
+                # 已经开流，只能把错误作为事件下发（不能再改状态码）。
+                try:
+                    self._sse_send({"type": "error", "error": str(ex)})
+                except Exception:
+                    pass
         elif path == "/api/ingest":
             payload = self._read_json()
             if payload is None:
@@ -258,7 +317,7 @@ class WebGatewayPlugin(BasePlugin):
     """零依赖 HTTP 网关。"""
 
     name = "web_gateway"
-    version = "0.2.0"
+    version = "0.3.0"
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(config)
@@ -284,6 +343,26 @@ class WebGatewayPlugin(BasePlugin):
             return "(网关未绑定应用)"
         return self._app.handle(text, session_id=session_id, user_id=user_id,
                                 meta=meta)
+
+    def stream(self, text: str, *, session_id: str = "default",
+               user_id: Optional[str] = None,
+               meta: Optional[Dict[str, Any]] = None):
+        """流式版 ``handle``：逐条产出事件（供 SSE 下发）。
+
+        应用没实现 ``stream`` 时**降级**为"整块当一次 delta"，保证接口永远可用。
+        """
+        if self._app is None:
+            yield {"type": "error", "error": "网关未绑定应用"}
+            return
+        fn = getattr(self._app, "stream", None)
+        if not callable(fn):
+            yield {"type": "delta",
+                   "text": self.handle(text, session_id=session_id,
+                                       user_id=user_id, meta=meta)}
+            yield {"type": "done", "session_id": session_id}
+            return
+        for ev in fn(text, session_id=session_id, user_id=user_id, meta=meta):
+            yield ev
 
     def ingest(self, items: List[Dict[str, Any]]) -> int:
         """把外部（站点 CMS / 爬虫 / 客服后台）的数据推进资料库。"""

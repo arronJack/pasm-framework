@@ -42,6 +42,50 @@ curl -X POST http://127.0.0.1:8080/api/chat \
 
 多语言客户端见 [09 多语言客户端](09-polyglot-clients.md)。
 
+### 2.2b 流式调用（SSE，体验最好）
+
+```bash
+curl -N -X POST http://127.0.0.1:8080/api/chat/stream \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer your-secret' \
+  -d '{"text":"怎么退货？","session_id":"user-42"}'
+```
+```
+data: {"type":"delta","text":"商品签收"}
+data: {"type":"delta","text":"后 7 天内"}
+data: {"type":"delta","text":"可无理由退货。"}
+data: {"type":"done","session_id":"user-42","chars":16}
+```
+
+前端（浏览器原生 EventSource 不支持 POST，用 `fetch` + `ReadableStream`；
+内置 Widget 就是这么写的，可以直接照抄）：
+
+```js
+const resp = await fetch("/api/chat/stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "Authorization": "Bearer your-secret" },
+  body: JSON.stringify({ text, session_id: sid }),
+});
+const rd = resp.body.getReader(), dec = new TextDecoder();
+let buf = "", acc = "";
+for (;;) {
+  const { value, done } = await rd.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });
+  const parts = buf.split("\n\n"); buf = parts.pop();
+  for (const p of parts) {
+    if (!p.startsWith("data:")) continue;
+    const ev = JSON.parse(p.slice(5).trim());
+    if (ev.type === "delta")        { acc += ev.text; render(acc); }
+    else if (ev.type === "replace") { acc = ev.text; render(acc); }  // 护栏改写过 → 替换
+    else if (ev.type === "error")   { showError(ev.error); }
+  }
+}
+```
+
+> **`replace` 事件必须处理**。它是护栏/润色改写内容后的"纠正通知"——
+> 忽略它意味着用户屏幕上会残留未脱敏的文本。
+> 想知道为什么需要它，见 [05 教程 §8](05-llm-integration.md)。
+
 ### 2.3 把站点数据推进资料库
 
 ```bash
@@ -59,6 +103,7 @@ curl -X POST http://127.0.0.1:8080/api/ingest \
 | 方法 | 路径 | 说明 | 鉴权 |
 | --- | --- | --- | --- |
 | POST | `/api/chat` | `{text, session_id?, user_id?, meta?}` → `{reply, session_id}` | 是 |
+| POST | `/api/chat/stream` | 同上入参 → **SSE**（`delta`/`replace`/`done`/`error`） | 是 |
 | POST | `/api/ingest` | `{items:[…]}` → `{added,total,docs,qa}` | 是 |
 | POST | `/api/sessions/reset` | `{session_id}` → `{ok}` | 是 |
 | GET | `/api/plugins` | 插件清单与启用状态 | 是 |
