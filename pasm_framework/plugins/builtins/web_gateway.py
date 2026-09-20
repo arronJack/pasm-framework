@@ -6,24 +6,40 @@
 
 接口
 ----
+对话（公开作用域，可被访客浏览器调用）
   · ``POST /api/chat``            ``{text, session_id?, user_id?, meta?}`` → ``{reply, session_id}``
   · ``POST /api/chat/stream``     同上入参，返回 **SSE**（``text/event-stream``）：
                                   ``{"type":"delta","text":…}`` /
                                   ``{"type":"replace","text":…}`` /
                                   ``{"type":"done",…}`` / ``{"type":"error",…}``
+
+站点接入资产（**任意语言写的站点都能用**，免鉴权，本身不含密钥）
+  · ``GET  /embed.js``            一行式客服挂件：``<script src="…/embed.js"
+                                  data-pasm-token="…" data-title="在线客服"></script>``
+  · ``GET  /console``             站点主人控制台（看状态 / 导入资料 / 复制嵌入代码 / 试聊）
+  · ``GET  /`` 或 ``/widget``     自包含聊天页（供 ``<iframe>`` 直接嵌入）
+
+资料与运维（**管理作用域**，需管理令牌）
   · ``POST /api/ingest``          ``{items:[{title,content,source?,tags?}]}`` → ``{added}``
+  · ``POST /api/ingest/text``     ``{text, source?, title?}`` → 长文自动切块入库；
+                                  段落形如 ``问：…/答：…``（或 ``Q:/A:``）会按问答对沉淀
+  · ``GET  /api/sessions``        ``{count, sessions:[{session_id,user_id,messages,…}]}``
   · ``POST /api/sessions/reset``  ``{session_id}`` → ``{ok}``
   · ``GET  /healthz``             健康 + 指标（来自 observability 插件）
   · ``GET  /api/plugins``         已加载/已启用插件清单
   · ``GET  /api/summary``         应用快照（能力、插件、指标）
   · ``GET  /api/kb/stats``        资料库统计
-  · ``GET  /`` 或 ``/widget``     自包含的可嵌入聊天 Widget
 
-安全
+安全（两种令牌，作用域分离）
 ----
-  · ``token``          配置后所有接口（除 ``/healthz``）需带
-                       ``Authorization: Bearer <token>`` 或 ``X-Pasm-Token``；
-    · ``rate_limit``     每 IP 每分钟请求上限（0 = 不限流）；
+  · ``token``           **管理令牌**：配置后，管理类接口需带
+                        ``Authorization: Bearer <token>`` 或 ``X-Pasm-Token``。
+  · ``public_token``    **公开令牌**（可选）：只授权"对话"，可安全嵌到第三方站点。
+    为什么需要它：浏览器挂件必须把令牌放在页面里，访问者都能看到 ——
+    若直接嵌管理令牌，等于把"导入资料 / 重置会话"的权限公开了。
+    配了 ``public_token`` 后，``/``、``/embed.js`` 下发的都是它，管理接口仍只认 ``token``。
+    未配置时回落到 ``token``（行为与旧版完全一致）。
+  · ``rate_limit``     每 IP 每分钟请求上限（0 = 不限流）；
   · ``max_body``       请求体字节上限（防超大 payload 打爆内存）；
   · ``allowed_origins`` CORS 白名单（``*`` 或具体来源）。
 
@@ -38,6 +54,123 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 from ..core import BasePlugin, PluginContext
+from ._web_assets import CONSOLE_HTML, EMBED_JS
+
+#: 完全公开的路径（纯静态资产，或按设计就该给访客看的内容）。
+#: 注意它们**本身不含任何密钥**：挂件页里的令牌由 ``public_token`` 注入。
+_PUBLIC_PATHS = ("/", "/widget", "/index.html", "/embed.js", "/console", "/healthz")
+
+#: 只需「公开作用域」的路径：对话。其余一律要管理令牌。
+_CHAT_PATHS = ("/api/chat", "/api/chat/stream")
+
+#: ``ingest_text`` 把长文切成多长的块（字符）。太大 → 检索命中后回复里塞满无关内容；
+#: 太小 → 一句话被切断、语义破碎。800 字符约合中文 2–4 段，是"能独立成条"的量级。
+_CHUNK_CHARS = 800
+
+#: 短于此长度的段落视为"碎片"（小标题、单句），会被并入相邻段而不是独立成条 ——
+#: 一个只有标题的块既是噪声、又几乎匹配不到任何问句。
+_MIN_CHUNK = 24
+
+#: 形如 ``问：…`` / ``Q: …`` 的行会被当作问答对的提问行。
+_QA_Q_PREFIX = ("问：", "问:", "Q:", "q:", "Q：", "q：")
+_QA_A_PREFIX = ("答：", "答:", "A:", "a:", "A：", "a：")
+
+
+def _split_qa_units(para: str) -> List[str]:
+    """段落里若含**多组** ``问：`` 开头的问答，按组拆开（一组一块）。
+
+    站点主人常把整页 FAQ 连着贴下来、组与组之间没有空行；
+    此时"一组问答"才是真正的语义单位，整段当一个块会让检索失准。
+    只有一组时原样返回（不做无谓拆分）。
+    """
+    lines = [ln for ln in (para or "").split("\n") if ln.strip()]
+    n_q = sum(1 for ln in lines if ln.strip().startswith(_QA_Q_PREFIX))
+    if n_q < 2:
+        return [para]
+    units: List[str] = []
+    buf: List[str] = []
+    for ln in lines:
+        if buf and ln.strip().startswith(_QA_Q_PREFIX):
+            units.append("\n".join(buf))
+            buf = []
+        buf.append(ln)
+    if buf:
+        units.append("\n".join(buf))
+    return units
+
+
+def _split_chunks(text: str, limit: int = _CHUNK_CHARS) -> List[str]:
+    """把长文切成若干块：**空行分段即语义边界，一段一块**。
+
+    为什么不再"把小段贪心合并到 limit 以内"：那样会把作者已用空行分开的
+    不同主题揉进同一个块。实测后果很直接 —— 把"退货 / 发货 / 积分 / 配送"
+    四段合并成一块后，问"积分怎么算"返回的是**退货**的内容（因为该块以退货
+    开头），检索精度整个塌掉。填空隙的收益远小于这个代价，所以取消跨段合并。
+
+    仍保留两条必要的处理：
+
+    - 段内含多组 ``问：/答：`` → 按问答组拆开（见 :func:`_split_qa_units`）；
+    - 极短段（长不过 ``_MIN_CHUNK``，如光秃秃的小标题）→ 并入**下一段**，
+      因为一个只有标题的块既是噪声、又几乎匹配不到任何问句；
+      标题按写作习惯属于紧随其后的正文。
+
+    超长段（> ``limit``）按字符硬切，避免单块过大把回复撑爆。
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paras:                                   # 没有空行 → 按单行分
+        paras = [p.strip() for p in text.split("\n") if p.strip()]
+
+    units: List[str] = []
+    for p in paras:
+        units.extend(_split_qa_units(p))
+
+    chunks: List[str] = []
+    pending = ""                                    # 太短、等并入下一段的碎片
+    for u in units:
+        if pending:
+            u = pending + "\n" + u
+            pending = ""
+        # 完整的问答对**直接成块**，不参与"碎片并入下一段"的合并 ——
+        # 一组问答本身就是语义完整的单位，短（"问：包邮吗？/答：满99包邮。"）
+        # 不代表它不完整。若与其它问答合并，:func:`_as_qa_pair` 只会取到第一组，
+        # 后面的问答就丢了。
+        if _as_qa_pair(u) is not None:
+            chunks.append(u)
+            continue
+        if len(u) < _MIN_CHUNK:                     # 碎片 → 攒着给下一段
+            pending = u
+            continue
+        if len(u) > limit:                          # 单段超长 → 硬切
+            for i in range(0, len(u), limit):
+                chunks.append(u[i:i + limit])
+            continue
+        chunks.append(u)
+    if pending:                                     # 末尾孤零零的碎片也不能丢
+        chunks.append(pending)
+    return chunks
+
+
+def _as_qa_pair(chunk: str) -> Optional[tuple]:
+    """把 ``问：X`` / ``答：Y`` 形态的段落识别成问答对；不是则返回 ``None``。
+
+    只认"提问行在前、回答行在后、且都在同一段落里"这一种紧凑写法 ——
+    刻意保守，避免把正常文档误判成问答而丢掉上下文。
+    """
+    lines = [ln.strip() for ln in (chunk or "").split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return None
+    q = a = ""
+    for ln in lines:
+        if not q and ln.startswith(_QA_Q_PREFIX):
+            q = ln[2:].strip()                  # 所有前缀都是 2 字符（"问：" / "Q:"）
+        elif q and not a and ln.startswith(_QA_A_PREFIX):
+            a = ln[2:].strip()
+    if q and a:
+        return (q, a)
+    return None
 
 # 模板里的 __TOKEN__ 会被替换为配置的令牌（未配置则留空 → 前端不带鉴权头）。
 _WIDGET_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -163,20 +296,36 @@ class _Handler(BaseHTTPRequestHandler):
         return (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
                 or self.client_address[0])
 
-    def _authorized(self, path: str) -> bool:
-        token = self._gw.token
-        if not token or path == "/healthz":
-            return True
+    def _presented_token(self) -> str:
         got = self.headers.get("X-Pasm-Token", "")
         if not got:
             auth = self.headers.get("Authorization", "")
             if auth.lower().startswith("bearer "):
                 got = auth[7:].strip()
-        return got == token
+        return got
 
-    def _guard(self, path: str) -> bool:
+    def _authorized(self, path: str, *, admin: bool = True) -> bool:
+        """作用域感知的鉴权。
+
+        ``admin=True``（默认）→ 只认管理令牌；
+        ``admin=False``        → 认管理令牌，若配了 ``public_token`` 也认它（仅对话用）。
+        """
+        token = self._gw.token
+        if not token and not self._gw.public_token:
+            return True                       # 完全没设令牌 = 开放模式（本机开发）
+        if path in _PUBLIC_PATHS:
+            return True                       # 公开资产，本身不含密钥
+        got = self._presented_token()
+        if token and got == token:
+            return True                       # 管理令牌在两种作用域下都通行
+        pub = self._gw.public_token
+        if not admin and pub and got == pub:
+            return True
+        return False
+
+    def _guard(self, path: str, *, admin: bool = True) -> bool:
         """鉴权 + 限流。返回 True 表示可以继续处理。"""
-        if not self._authorized(path):
+        if not self._authorized(path, admin=admin):
             self._send(401, {"error": "unauthorized",
                              "hint": "请在请求头带 Authorization: Bearer <token>"})
             return False
@@ -226,8 +375,16 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._guard(path):
             return
         if path in ("/", "/widget", "/index.html"):
-            html = _WIDGET_HTML.replace("__TOKEN__", gw.token or "")
+            # 注入**公开令牌**（而非管理令牌）：这个页面是要给访客看的，
+            # 把它 iframe 进站点时，源码里能读到什么，访客就能读到什么。
+            html = _WIDGET_HTML.replace("__TOKEN__", gw.serve_token)
             self._send(200, html, "text/html")
+        elif path == "/embed.js":
+            # 一行式挂件脚本：不含密钥（令牌由站主的 <script> 标签属性传入）。
+            self._send(200, EMBED_JS, "application/javascript")
+        elif path == "/console":
+            # 站点主人控制台：静态壳，不含密钥；令牌由使用者在页面里填。
+            self._send(200, CONSOLE_HTML, "text/html")
         elif path == "/healthz":
             self._send(200, gw.health())
         elif path == "/api/plugins":
@@ -236,16 +393,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, gw.summary())
         elif path == "/api/kb/stats":
             self._send(200, gw.kb_stats())
+        elif path == "/api/sessions":
+            self._send(200, gw.sessions_info())
         else:
             self._send(404, {"error": "not found", "paths": [
-                "/", "/widget", "/healthz", "/api/chat", "/api/chat/stream",
-                "/api/ingest", "/api/plugins", "/api/summary", "/api/kb/stats",
-                "/api/sessions/reset"]})
+                "/", "/widget", "/embed.js", "/console", "/healthz",
+                "/api/chat", "/api/chat/stream", "/api/ingest", "/api/ingest/text",
+                "/api/plugins", "/api/summary", "/api/kb/stats",
+                "/api/sessions", "/api/sessions/reset"]})
 
     def do_POST(self):  # noqa: N802
         gw = self._gw
         path = self.path.split("?")[0]
-        if not self._guard(path):
+        # 对话走「公开作用域」（可用 public_token），资料/会话管理走管理作用域。
+        if not self._guard(path, admin=(path not in _CHAT_PATHS)):
             return
         if path == "/api/chat":
             payload = self._read_json()
@@ -300,6 +461,24 @@ class _Handler(BaseHTTPRequestHandler):
                                  "hint": "在 backend_config 中开启 knowledge_base"})
                 return
             self._send(200, {"added": added, **gw.kb_stats()})
+        elif path == "/api/ingest/text":
+            payload = self._read_json()
+            if payload is None:
+                return
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                self._send(400, {"error": "text required"})
+                return
+            res = gw.ingest_text(
+                text,
+                source=str(payload.get("source") or "console"),
+                title=str(payload.get("title") or ""),
+            )
+            if res is None:
+                self._send(409, {"error": "knowledge_base 插件未启用",
+                                 "hint": "在 backend_config 中开启 knowledge_base"})
+                return
+            self._send(200, res)
         elif path == "/api/sessions/reset":
             payload = self._read_json()
             if payload is None:
@@ -325,11 +504,21 @@ class WebGatewayPlugin(BasePlugin):
         self._port: int = int(self.config.get("port", 8080))
         self._allowed_origins: str = str(self.config.get("allowed_origins", "*"))
         self.token: str = str(self.config.get("token", "") or "")
+        # 公开令牌：只授权对话，可安全嵌进第三方站点（不配则沿用 token，行为同旧版）。
+        self.public_token: str = str(self.config.get("public_token", "") or "")
         self.max_body: int = int(self.config.get("max_body", 256 * 1024))
         self.limiter = _RateLimiter(int(self.config.get("rate_limit", 0)))
         self._app: Optional[Any] = None
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+
+    @property
+    def serve_token(self) -> str:
+        """下发给浏览器的令牌（挂件页 / 嵌入代码用）。
+
+        优先 ``public_token``；没配才回落到 ``token``。
+        """
+        return self.public_token or self.token
 
     def on_init(self, ctx: PluginContext) -> None:
         self._app = ctx.app
@@ -381,6 +570,55 @@ class WebGatewayPlugin(BasePlugin):
             return dict(kb.stats(), enabled=True)
         except Exception:
             return {"enabled": True}
+
+    def sessions_info(self, limit: int = 50) -> Dict[str, Any]:
+        """会话概览（**只给概要，不含对话正文**）。
+
+        管理台能列出"最近有哪些人来聊过、聊了几轮"，但看不到具体内容 ——
+        客户对话属于敏感数据，不该因为打开一个网页就整批暴露。
+        """
+        pm = getattr(self._app, "plugins", None) if self._app is not None else None
+        sp = pm.get("sessions") if pm is not None else None
+        if sp is None or not pm.is_enabled("sessions"):
+            return {"enabled": False, "sessions": []}
+        try:
+            rows = sp.list_sessions(limit=limit)
+            return {"enabled": True, "count": sp.count(), "sessions": rows}
+        except Exception:
+            return {"enabled": True, "count": 0, "sessions": []}
+
+    def ingest_text(self, text: str, *, source: str = "console",
+                    title: str = "") -> Optional[Dict[str, Any]]:
+        """把**一整篇文本**（粘贴的 FAQ、帮助文档、产品说明）喂进资料库。
+
+        与 ``ingest(items)`` 的区别：那个要调用方自己切好条目，这个负责切。
+        切法是"**空行分段即语义边界，一段一块**"，段内多组 ``问：/答：`` 按组拆开；
+        问答对会被存成问答对（检索时享有更高权重，命中更准）。
+
+        返回 ``None`` 表示知识库未启用（调用方据此回 409）。
+        """
+        pm = getattr(self._app, "plugins", None) if self._app is not None else None
+        kb = pm.get("knowledge_base") if pm is not None else None
+        if kb is None or not pm.is_enabled("knowledge_base"):
+            return None
+
+        chunks = _split_chunks(text)
+        added = qa = 0
+        for i, ck in enumerate(chunks):
+            pair = _as_qa_pair(ck)
+            if pair is not None:
+                kb.ingest_qa(pair[0], pair[1], source=source)
+                qa += 1
+                added += 1
+                continue
+            # 标题：整篇给了 title 就加序号（便于来源可溯）；否则取该块首行。
+            if title:
+                t = "%s（%d）" % (title, i + 1) if len(chunks) > 1 else title
+            else:
+                t = (ck.split("\n", 1)[0] or "资料")[:60]
+            n = kb.ingest([{"title": t, "content": ck, "source": source}])
+            added += n
+        return {"added": added, "qa": qa, "chunks": len(chunks), **self.kb_stats()}
 
     def reset_session(self, session_id: str) -> bool:
         pm = getattr(self._app, "plugins", None) if self._app is not None else None

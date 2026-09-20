@@ -106,8 +106,11 @@ class BaseApplication(BaseAgent):
         去重按 ``title``；凡"有依据的知识"（领域 / 知识库）都带 ``source``，
         纯对话记忆（episodic）不带 —— 应用可据此区分"资料"与"闲聊"。
         """
-        hits = super().recall(query, k=k)
-        seen = {h.get("title") for h in hits}
+        # 对话记忆（episodic）—— 不带 source。
+        memories = super().recall(query, k=k)
+        seen = {h.get("title") for h in memories}
+        # 「有依据的知识」单独收集：领域 + 知识库。
+        sourced: List[Dict[str, Any]] = []
 
         if hasattr(self.domain, "knowledge_for"):
             try:
@@ -118,7 +121,7 @@ class BaseApplication(BaseAgent):
                     it = dict(item)
                     it.setdefault("source",
                                   "domain:%s" % type(self.domain).__name__)
-                    hits.append(it)
+                    sourced.append(it)
                     seen.add(it.get("title"))
             except Exception:
                 pass
@@ -132,12 +135,41 @@ class BaseApplication(BaseAgent):
                     for item in kb.recall(query, k=k):
                         if item.get("title") in seen:
                             continue
-                        hits.append(item)
+                        sourced.append(item)
                         seen.add(item.get("title"))
                 except Exception:
                     pass
 
-        return hits[:k] if k else hits
+        # 排序：**有依据的知识优先于对话记忆**。
+        # 否则"上次聊过一句提到过某个词"的闲聊记忆会排到 FAQ 前面，
+        # 客服就变成"答非所问"（实测过：闲聊记忆抢占，资料库排到了后面）。
+        merged = sourced + memories
+        return merged[:k] if k else merged
+
+    # ---- 区分「资料」与「闲聊」---------------------------------
+    def knowledge_facts(
+        self, facts: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """从检索结果里挑出**有依据的知识**（带 ``source`` 的那些）。
+
+        为什么必须有这个方法：``recall()`` 返回的是**混合**结果 ——
+        引擎的对话记忆（episodic，不带 ``source``）+ 领域知识 + 知识库资料
+        （都带 ``source``）。写 ``_render_reply`` 时如果直接取 ``facts[0]``
+        就会把"上一轮用户自己说过的话"当成资料答回去。
+
+        实测过的翻车现场：用户问"你们老板叫什么"，
+        系统把上一轮的"积分怎么算"当成资料答了出来 ——
+        因为那条对话记忆被检索命中，而它**不是知识**。
+
+        所以任何"就资料作答"的回复策略都应该先过这个过滤器::
+
+            def _render_reply(self, text, facts, mood):
+                k = self.knowledge_facts(facts)
+                return k[0]["brief"] if k else "抱歉，我暂时没有相关资料。"
+
+        保持原顺序（资料在前、且各自内部已按相关度排序），只做过滤不做重排。
+        """
+        return [f for f in (facts or []) if f.get("source")]
 
     # ---- 对话（覆盖基类，支持注入已检索事实）-----------------
     def chat(self, text: str, facts: Optional[List[Dict[str, Any]]] = None) -> str:

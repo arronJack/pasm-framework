@@ -80,3 +80,25 @@ class SessionsPlugin(BasePlugin):
 
     def reset(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+
+    def list_sessions(self, limit: int = 0) -> List[Dict[str, Any]]:
+        """按最近活跃倒序列出会话（供管理台 / 运营看板使用）。
+
+        ``limit`` 为 0 表示不限条数。只暴露**概要**（不含消息正文），
+        避免把客户对话内容整批吐给任何能打开管理台的人。
+        """
+        rows = [
+            {
+                "session_id": s.session_id,
+                "user_id": s.user_id,
+                "messages": len(s.messages),
+                "created_at": round(s.created_at, 3),
+                "last_active": round(s.last_active, 3),
+            }
+            for s in self._sessions.values()
+        ]
+        rows.sort(key=lambda r: r["last_active"], reverse=True)
+        return rows[:limit] if limit else rows
+
+    def count(self) -> int:
+        return len(self._sessions)
