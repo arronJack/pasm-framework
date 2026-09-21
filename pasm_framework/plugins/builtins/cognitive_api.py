@@ -79,6 +79,22 @@ class CognitiveAPI:
     # ---------------------------------------------------------- 元信息
 
     @property
+    def capabilities(self) -> Optional[Any]:
+        """底层能力门面 —— **供同进程的调用方复用同一个 registry**。
+
+        ★ 为什么必须暴露（而不是让调用方自己 new 一个）
+        --------------------------------------------
+        ``AgentRegistry`` 是**进程内的实例缓存**。如果业务侧自己 ``Capabilities(
+        AgentRegistry(...))``，就会存在两个 registry：HTTP 写入的记忆，
+        进程内读不到；进程内写的，HTTP 也看不到 ——
+        表现是"接口都通、数据却分叉"，而且**不会报任何错**，极难查。
+
+        所以：同一个进程里要用认知能力，一律走这里拿，不要再 new 一个。
+        （``pasm-medical`` 的 :class:`MedicalService` 就是这么用的。）
+        """
+        return self._caps
+
+    @property
     def available(self) -> bool:
         return self._caps is not None
 
