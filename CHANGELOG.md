@@ -2,6 +2,28 @@
 
 本文件记录 pasm-framework 的重要变更。
 
+## [0.5.2] — 2026-09-21
+
+### 新增
+
+- **`CognitiveAPI.capabilities` 访问器** —— 暴露底层的 `Capabilities` 门面，
+  供**同进程**的调用方复用同一个 `AgentRegistry`。
+
+  **为什么必须暴露**：`AgentRegistry` 是**进程内的实例缓存**。如果业务侧自己
+  `Capabilities(AgentRegistry(...))`，就会存在两个 registry：
+
+  > HTTP 写入的记忆，进程内读不到；进程内写的，HTTP 也看不到。
+  > 表现是"接口都通、数据却分叉"，而且**不报任何错**，极难查。
+
+  所以约定：同一个进程里要用认知能力，一律走 `gateway.cognitive.capabilities` 拿，
+  不要再 new 一个。（`pasm-medical` 的 `MedicalService` 就是这么用的。）
+
+### 变更
+
+- `plugins/builtins/__init__.py` 一并导出 `CognitiveAPI`，方便按包导入
+  （此前只能从 `...builtins.cognitive_api` 这个具体模块路径导入）。
+  `WebGatewayPlugin` 的内部行为不变。
+
 ## [0.5.1] — 2026-09-21
 
 ### 文档

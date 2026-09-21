@@ -7,10 +7,16 @@
   · ``warmth``          回复温度 / 情感润色
   · ``safety``          护栏（注入拦截 + PII 脱敏）
   · ``observability``   可观测（指标 + 健康）
-  · ``web_gateway``     零依赖 HTTP 网关（iframe / REST）
+  · ``web_gateway``     零依赖 HTTP 网关（iframe / REST / SSE）
+
+另有一个**不是插件**的模块也在这里导出：
+  · ``CognitiveAPI``    认知 HTTP 适配器（``/api/cog/*``）。它由 ``web_gateway``
+    持有并复用同一台服务器与同一套令牌 —— **不是一个独立插件**，
+    因为认知接口能写记忆、改人格，绝不能自成一个鉴权洼地。
 """
 from __future__ import annotations
 
+from .cognitive_api import CognitiveAPI
 from .knowledge_base import KnowledgeBasePlugin
 from .llm_responder import LLMResponderPlugin
 from .observability import ObservabilityPlugin
@@ -27,4 +33,5 @@ __all__ = [
     "SafetyPlugin",
     "ObservabilityPlugin",
     "WebGatewayPlugin",
+    "CognitiveAPI",
 ]
