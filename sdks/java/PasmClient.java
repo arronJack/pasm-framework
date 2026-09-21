@@ -208,6 +208,132 @@ public class PasmClient implements AutoCloseable {
     /** 健康检查（免鉴权）。 */
     public String health()   { return send("GET", "/healthz", null); }
 
+    // ---- 认知能力（/api/cog/*，管理作用域）--------------------------------
+    //
+    // 这一组是给「要长记忆的业务系统」用的：把记忆、情绪、行为倾向接到自己的
+    // 后端里，而不是只拿一句问答。
+    //
+    // 返回值一律是**原始 JSON 字符串** —— 认知响应是嵌套结构（hit 数组、
+    // 权重表），本类自带的极简 `Json.pick()` 只够取顶层标量。项目里已有
+    // Jackson/Gson 的，直接拿这个字符串反序列化成自己的 DTO 即可。
+    //
+    // 为什么要 GET 而不是全用 POST：只读操作（status/context/recall/semantic）
+    // 用 GET 才能被浏览器/代理缓存与直接调试；写入操作一律 POST。
+    //
+    // ★ 全部需要**管理令牌**：认知接口能写记忆、改人格，比对话敏感得多。
+
+    /** 能力探测：返回可用操作清单。用它做启动自检，别硬编码操作名。 */
+    public String cogCapabilities() { return send("GET", "/api/cog/capabilities", null); }
+
+    public String cogStatus(String agentId) {
+        return send("GET", "/api/cog/status?" + agentIdQuery(agentId), null);
+    }
+
+    /** 取认知上下文（**只读，不写记忆**）：注入到大模型提示词用的一号接口。 */
+    public String cogContext(String agentId, String query, int k) {
+        return send("GET", "/api/cog/context?" + agentIdQuery(agentId)
+                + "&k=" + k + "&query=" + urlenc(query), null);
+    }
+
+    public String cogRecall(String agentId, String query, int k) {
+        return send("GET", "/api/cog/recall?" + agentIdQuery(agentId)
+                + "&k=" + k + "&query=" + urlenc(query), null);
+    }
+
+    /** 语义检索，并解释每条**为什么**被召回（要能回答"你凭哪一条这么说的"）。 */
+    public String cogSemantic(String agentId, String query, int k) {
+        return send("GET", "/api/cog/semantic?" + agentIdQuery(agentId)
+                + "&k=" + k + "&query=" + urlenc(query), null);
+    }
+
+    /** 写入一条记忆。salience 1–5，5 = 关键事实（不会被闲聊挤掉）。 */
+    public String cogObserve(String agentId, String title, String brief,
+                             List<String> tags, int salience) {
+        StringBuilder b = new StringBuilder();
+        b.append("{\"agent_id\":\"").append(Json.esc(agentId)).append("\",");
+        b.append("\"title\":\"").append(Json.esc(title)).append("\",");
+        b.append("\"brief\":\"").append(Json.esc(brief)).append("\",");
+        b.append("\"salience\":").append(salience).append(",\"tags\":[");
+        if (tags != null) {
+            for (int i = 0; i < tags.size(); i++) {
+                if (i > 0) b.append(',');
+                b.append('"').append(Json.esc(tags.get(i))).append('"');
+            }
+        }
+        b.append("]}");
+        return send("POST", "/api/cog/observe", b.toString());
+    }
+
+    /** 报告带情绪效价的事件（valence ∈ [-1,1]）。 */
+    public String cogFeel(String agentId, String event, double valence) {
+        return send("POST", "/api/cog/feel", "{\"agent_id\":\"" + Json.esc(agentId)
+                + "\",\"event\":\"" + Json.esc(event) + "\",\"valence\":" + valence + "}");
+    }
+
+    /** 反馈塑形。**务必带 action**，否则长期会让行为分布极端化。 */
+    public String cogFeedback(String agentId, String kind, String action) {
+        StringBuilder b = new StringBuilder();
+        b.append("{\"agent_id\":\"").append(Json.esc(agentId)).append("\",");
+        b.append("\"kind\":\"").append(Json.esc(kind)).append("\"");
+        if (action != null && !action.isEmpty()) {
+            b.append(",\"action\":\"").append(Json.esc(action)).append("\"");
+        }
+        return send("POST", "/api/cog/feedback", b.append('}').toString());
+    }
+
+    /** 按性格 + 学到的偏好选一个动作。 */
+    public String cogAct(String agentId, List<String> candidates) {
+        StringBuilder b = new StringBuilder();
+        b.append("{\"agent_id\":\"").append(Json.esc(agentId)).append("\"");
+        if (candidates != null && !candidates.isEmpty()) {
+            b.append(",\"candidates\":[");
+            for (int i = 0; i < candidates.size(); i++) {
+                if (i > 0) b.append(',');
+                b.append('"').append(Json.esc(candidates.get(i))).append('"');
+            }
+            b.append(']');
+        }
+        return send("POST", "/api/cog/act", b.append('}').toString());
+    }
+
+    /** 记忆巩固（睡眠回放）。apply=false 只给建议、不落盘 —— 建议默认取这个。 */
+    public String cogConsolidate(String agentId, boolean apply) {
+        return send("POST", "/api/cog/consolidate", "{\"agent_id\":\"" + Json.esc(agentId)
+                + "\",\"apply\":" + apply + "}");
+    }
+
+    /** 查看人格。 */
+    public String cogPersona(String agentId) {
+        return send("GET", "/api/cog/persona?" + agentIdQuery(agentId), null);
+    }
+
+    /** 合并式更新人格（没传的键不会被抹掉）。 */
+    public String cogSetPersona(String agentId, String personaJson) {
+        return send("POST", "/api/cog/persona", "{\"agent_id\":\"" + Json.esc(agentId)
+                + "\",\"persona\":" + personaJson + "}");
+    }
+
+    /** 落盘（agentId 传 null 则落盘全部已加载的 agent）。 */
+    public String cogSave(String agentId) {
+        String body = (agentId == null) ? "{}"
+                : "{\"agent_id\":\"" + Json.esc(agentId) + "\"}";
+        return send("POST", "/api/cog/save", body);
+    }
+
+    private static String agentIdQuery(String agentId) {
+        return "agent_id=" + urlenc(agentId == null ? "default" : agentId);
+    }
+
+    /**
+     * 百分号编码（UTF-8）。
+     * ★ 必须做：查询串里会有中文（"青霉素"），不编码会直接被网关当成非法请求；
+     *   而且 `&`/`=`/空格 不编码会**改变参数结构**（不是"少个字符"而已）。
+     */
+    static String urlenc(String s) {
+        return java.net.URLEncoder.encode(s == null ? "" : s,
+                java.nio.charset.StandardCharsets.UTF_8);
+    }
+
     @Override public void close() { /* HttpClient 无需显式关闭（JDK 21+ 可 close） */ }
 
     // ---- JSON 组装 ----
@@ -255,6 +381,15 @@ public class PasmClient implements AutoCloseable {
         try (PasmClient c = new PasmClient(url, tok)) {
             System.out.println("health: " + Json.pick(c.health(), "status"));
             System.out.println("reply : " + c.chat("怎么退货？"));
+            // 认知接口冒烟：拿不到就说明服务端 < 0.5.0 或认知层没装
+            String caps = c.cogCapabilities();
+            System.out.println("cog   : " + Json.pick(caps, "available")
+                    + " ops=" + Json.pick(caps, "operations"));
+            System.out.println("observe: " + Json.pick(
+                    c.cogObserve("smoke", "冒烟记忆", "由 PasmClient.main 写入",
+                            java.util.List.of("smoke"), 3), "ok"));
+            System.out.println("recall : " + Json.pick(
+                    c.cogRecall("smoke", "冒烟", 3), "count"));
         }
     }
 }

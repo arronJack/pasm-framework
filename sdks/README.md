@@ -87,6 +87,17 @@ Java / C# / Go 的用法见各自文件顶部的注释。
   NuGet / Maven Central / Packagist / npm / Go module 前，先按上表补齐验证。
 - Java 客户端为避免强制引入 Jackson/Gson，内置了一个极简 JSON 字段提取器
   （只够解析本网关的扁平响应）。项目里若已有 JSON 库，建议替换 `Json.pick()`。
+- **认知接口（`/api/cog/*`）目前只有 Java 客户端补齐了**（`cogCapabilities` /
+  `cogStatus` / `cogContext` / `cogRecall` / `cogSemantic` / `cogObserve` /
+  `cogFeel` / `cogAct` / `cogFeedback` / `cogConsolidate` / `cogPersona` /
+  `cogSave`，共 13 个）。这批方法**一律返回原始 JSON 字符串**，交给调用方已有的
+  JSON 库反序列化 —— 认知响应是嵌套结构（hit 数组、权重表），极简提取器应付不了，
+  硬写只会写出一个悄悄丢字段的解析器。
+  ⚠️ **同为未真机验证**（本机无 JDK）；结构与括号配平已用"HEAD 原版作对照"的方式核过增量。
+  其余语言（C# / Node / PHP / Go / Python）的认知方法尚**未提供**，见 `../CHANGELOG.md` 0.5.0。
+- ★ **GET 的查询参数必须 URL 编码**：查询串里有中文（如「青霉素」）时不编码会被网关
+  当成非法请求；而 `&`/`=`/空格 不编码会**改变参数结构**（不是"少个字符"）。Java 侧用
+  `PasmClient.urlenc()`。
 - **流式输出（SSE）尚未提供** —— 见 `../docs/capability-matrix-2026-09-20.md` §5 P0-1。
   客户端会在该特性落地后统一补 `chat_stream()`。
 - 生产环境请在前面加反向代理（TLS、连接池、限流），网关自身的限流只是兜底。

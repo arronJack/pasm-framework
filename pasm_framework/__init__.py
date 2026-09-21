@@ -39,7 +39,7 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
 """
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .adapter import (  # noqa: F401
     DomainAdapter,
@@ -296,6 +296,7 @@ def selftest() -> bool:
             # `_Handler._gw` 读的是 `self.server.gateway`，所以给个假 server 就能
             # 直接调鉴权逻辑，无需真的监听端口。
             from .plugins.builtins.web_gateway import _Handler as _GWHandler
+            from .plugins.builtins.cognitive_api import CognitiveAPI
 
             class _ProbeHandler(_GWHandler):
                 def __init__(self, gateway, path, headers=None):
@@ -330,6 +331,33 @@ def selftest() -> bool:
             _g3 = type(gw)({})                       # 无令牌 = 开发开放模式
             check(_ProbeHandler(_g3, "/console")._authorized("/console"),
                   "网关：无令牌配置时保持开放（兼容本机开发）")
+
+            # ---- 认知 HTTP API（/api/cog/*）
+            check(getattr(gw, "cognitive", None) is not None
+                  and gw.cognitive.available,
+                  "网关默认挂载认知 API（/api/cog/*）")
+            if getattr(gw, "cognitive", None) is not None:
+                check(len(gw.cognitive.operations()) == 13,
+                      "认知 API 覆盖 13 个操作：%s" % (gw.cognitive.operations(),))
+                check(CognitiveAPI.PREFIX == "/api/cog/",
+                      "认知前缀固定为 /api/cog/")
+            # ★ 认知接口落在**管理作用域**：它能写记忆、改人格、触发巩固，
+            #   绝不能像对话那样用公开令牌就能调。
+            #   注意作用域约束发生在**调用点**（do_GET 默认管理；
+            #   do_POST 用 `admin=(path not in _CHAT_PATHS)`），所以两条都要验：
+            #   ① 行为：公开令牌在管理作用域下被拒；
+            #   ② 名单：认知前缀不在对话（公开）作用域名单里。
+            from .plugins.builtins.web_gateway import _CHAT_PATHS
+            _hc = _ProbeHandler(_g, "/api/cog/status",
+                                {"Authorization": "Bearer PUB"})
+            check(_hc._authorized("/api/cog/status") is False,
+                  "★ 认知接口在管理作用域下拒绝公开令牌")
+            check(all(not p.startswith(CognitiveAPI.PREFIX) for p in _CHAT_PATHS),
+                  "★ 认知前缀不在对话公开作用域名单（→ POST 走管理作用域）")
+            check(_probe(_g, "/api/cog/status", "ADMIN"),
+                  "认知接口接受管理令牌")
+            check(type(gw)({"cognitive": False}).cognitive is None,
+                  "网关可用 cognitive=false 关掉认知接口")
 
             # ---- v0.2.1 收尾阶段不变式 ----
             # 1) on_reply_final 对**每条**回复路径恰好跑一次（生成/能力/模板）。

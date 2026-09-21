@@ -2,6 +2,39 @@
 
 本文件记录 pasm-framework 的重要变更。
 
+## [0.5.0] — 2026-09-21
+
+让**非 MCP 的客户端也能拿到认知能力**。此前「记忆 / 情绪 / 成长」这套只在
+MCP（stdio）通道上 —— Spring Boot、C#、Vue 后端这类客户端接上 HTTP 网关后，
+只拿得到"问答 + 资料库"，拿不到认知状态。这是给医院诊疗、ERP、教务这类
+「要长记忆的业务系统」补的关键一块。
+
+### 新增
+
+- **认知 HTTP API（`/api/cog/*`，13 个操作）** —— 新增
+  `plugins/builtins/cognitive_api.py`，挂在 `web_gateway` 的**同一台服务器**上：
+  - 只读：`capabilities` / `status` / `context` / `recall` / `semantic` / `focus`
+  - 写入：`observe` / `feel` / `act` / `feedback` / `consolidate` / `chat` / `persona` / `save`
+  - **不新开端口、不新造鉴权**：认知接口全部落在**管理作用域**。
+    它能写记忆、改人格、触发巩固，比对话敏感得多，绝不能像 `/api/chat`
+    那样用公开令牌就能调 —— 否则访客拿到公开令牌即可污染长期记忆。
+  - 用 `web_gateway.config.cognitive=false` 可整体关掉。
+- **不做第二份实现**：所有操作转发给 `pasm-skills` 的
+  `pasm_skills.cognition.Capabilities`（唯一实现）。MCP 与 HTTP 两个表面共用同一份逻辑，
+  避免"改了一边忘了另一边"的行为漂移 —— 本项目已因同源两份代码出过一次真实缺陷。
+- 依赖提升到 `pasm-skills>=0.6.0`。
+- `tools/e2e_cognitive_api.py`：**真起 HTTP 服务**的端到端验证（20 项，含鉴权、
+  参数错、跨 agent 隔离、原有路由未被影响）。
+- `tools/falsify_cognitive_api.py`：反例对照 —— 故意改坏后必须被抓到，
+  否则"全绿"不算数。
+
+### 修复
+
+- **`persona` 更新重启即丢**（由反例对照抓出）：基座 `_load_state` 刻意让
+  persona 以构造入参为准，于是"运行时改过的人格、重启就变回默认值"。
+  在 `pasm-skills` 侧（`AgentRegistry`）补上落盘读取，**不动基座**，
+  因此不影响已发布的产品智能体。
+
 ## [0.4.0] — 2026-09-20
 
 让框架从"能写应用"走到"**站点能直接用**"：一行脚本接入任意语言的网站，

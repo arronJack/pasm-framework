@@ -30,6 +30,26 @@
   · ``GET  /api/summary``         应用快照（能力、插件、指标）
   · ``GET  /api/kb/stats``        资料库统计
 
+认知能力（**管理作用域**，需管理令牌）—— 见 :mod:`.cognitive_api`
+  · ``GET  /api/cog/capabilities``  能力探测（含可用操作清单）
+  · ``GET  /api/cog/status?agent_id=``      档位 / 记忆量 / 情绪 / 认知层状态
+  · ``GET  /api/cog/context?agent_id=&query=&k=``  取认知上下文（只读，注入提示词用）
+  · ``GET  /api/cog/recall?agent_id=&query=&k=``   记忆检索
+  · ``GET  /api/cog/semantic?agent_id=&query=``    语义检索 + 为什么被召回（可解释）
+  · ``POST /api/cog/observe``      写入一条记忆 ``{agent_id,title,brief,tags,salience}``
+  · ``POST /api/cog/feel``         情绪效价 ``{agent_id,event,valence}``
+  · ``POST /api/cog/act``          按性格 + 学到的偏好选动作
+  · ``POST /api/cog/feedback``     反馈塑形 ``{agent_id,kind,action}``
+  · ``POST /api/cog/consolidate``  记忆巩固（``apply=false`` 只给建议）
+  · ``POST /api/cog/chat``         走完整认知回路（**模板渲染，非 LLM**）
+  · ``POST /api/cog/persona``      查看 / 合并式更新人格
+  · ``POST /api/cog/save``         落盘
+
+  为什么这段以前没有：认知能力原先只在 MCP（stdio）通道上，
+  Java / C# / Vue 后端这类非 MCP 客户端**根本拿不到**记忆与情绪。
+  现在它们和其他 REST 接口共用同一台服务器、同一套令牌与限流 ——
+  **认知写入比对话敏感得多**（能改记忆、改人格），所以全部落在管理作用域。
+
 安全（两种令牌，作用域分离）
 ----
   · ``token``           **管理令牌**：配置后，管理类接口需带
@@ -56,6 +76,11 @@ from urllib.parse import unquote
 
 from ..core import BasePlugin, PluginContext
 from ._web_assets import CONSOLE_HTML, EMBED_JS
+from .cognitive_api import CognitiveAPI
+
+#: 认知接口前缀。挂在这个网关下（而不是另起一个插件）是刻意的：
+#: 认知写入比对话敏感得多（它能改记忆、改人格），**不能自成一个鉴权洼地**。
+_COG_PREFIX = CognitiveAPI.PREFIX
 
 #: 真正**不含任何密钥、可无条件公开**的路径：静态 JS 与健康探针。
 #: 挂件页 / 管理台**不在此列** —— 它们要么注入令牌、要么是管理界面。
@@ -428,12 +453,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, gw.kb_stats())
         elif path == "/api/sessions":
             self._send(200, gw.sessions_info())
+        elif _COG_PREFIX.rstrip("/") in path or path.startswith(_COG_PREFIX):
+            self._cog("GET")
         else:
             self._send(404, {"error": "not found", "paths": [
                 "/", "/widget", "/embed.js", "/console", "/healthz",
                 "/api/chat", "/api/chat/stream", "/api/ingest", "/api/ingest/text",
                 "/api/plugins", "/api/summary", "/api/kb/stats",
-                "/api/sessions", "/api/sessions/reset"]})
+                "/api/sessions", "/api/sessions/reset",
+                _COG_PREFIX + "<op>"]})
 
     def do_POST(self):  # noqa: N802
         gw = self._gw
@@ -521,8 +549,37 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "session_id required"})
                 return
             self._send(200, {"ok": gw.reset_session(sid), "session_id": sid})
+        elif _COG_PREFIX.rstrip("/") in path or path.startswith(_COG_PREFIX):
+            self._cog("POST")
         else:
             self._send(404, {"error": "not found"})
+
+    # ---- 认知接口 --------------------------------------------------
+
+    def _cog(self, method: str) -> None:
+        """把 ``/api/cog/*`` 交给 :class:`CognitiveAPI`。
+
+        认知接口一律**管理作用域**：它能写记忆、改人格、触发巩固，
+        和"导入资料"同级甚至更高 —— 绝不能用公开令牌就能调。
+        """
+        gw = self._gw
+        api = getattr(gw, "cognitive", None)
+        if api is None:
+            self._send(404, {"error": "cognitive api disabled",
+                             "hint": "网关配置里 cognitive=false（或未启用）"})
+            return
+        path, _, query = self.path.partition("?")
+        body: Dict[str, Any] = {}
+        if method == "POST":
+            got = self._read_json()
+            if got is None:
+                return
+            body = got
+        out = api.dispatch(method, path, query, body)
+        if out is None:                                   # 理论上到不了这里
+            self._send(404, {"error": "not found"})
+            return
+        self._send(out[0], out[1])
 
 
 class WebGatewayPlugin(BasePlugin):
@@ -541,6 +598,15 @@ class WebGatewayPlugin(BasePlugin):
         self.public_token: str = str(self.config.get("public_token", "") or "")
         self.max_body: int = int(self.config.get("max_body", 256 * 1024))
         self.limiter = _RateLimiter(int(self.config.get("rate_limit", 0)))
+        # 认知接口：复用本网关的端口与令牌（见 _COG_PREFIX 注释）。
+        #   config 里可给 "cognitive": false 关掉；"cognitive_persist_dir" 指定落点。
+        self.cognitive = CognitiveAPI(
+            persist_root=(str(self.config["cognitive_persist_dir"])
+                          if self.config.get("cognitive_persist_dir") else None),
+            default_persona=(self.config.get("cognitive_persona")
+                             if isinstance(self.config.get("cognitive_persona"), dict)
+                             else None),
+        ) if self.config.get("cognitive", True) else None
         self._app: Optional[Any] = None
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
