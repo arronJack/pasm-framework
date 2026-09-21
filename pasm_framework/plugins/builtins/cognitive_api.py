@@ -94,8 +94,10 @@ class CognitiveAPI:
             "prefix": self.PREFIX,
             "operations": self.operations(),
             "error": self._err,
-            "note": ("认知能力的唯一实现位于 pasm_skills.cognition.Capabilities；"
-                     "MCP 与 HTTP 两个表面都转发到它，避免同源两份代码漂移。"),
+            "note": ("认知能力的共享实现位于 pasm_skills.cognition.Capabilities，"
+                     "本 HTTP 表面与桌面/脚本表面都转发到它。"
+                     "⚠️ pasm-mcp-server 目前仍是自己那份实现，尚未委托过来 —— "
+                     "改认知语义时两处都要动，直到 MCP 侧完成迁移。"),
         }
 
     # ---------------------------------------------------------- 分派

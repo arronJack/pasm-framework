@@ -20,8 +20,11 @@ MCP（stdio）通道上 —— Spring Boot、C#、Vue 后端这类客户端接�
     那样用公开令牌就能调 —— 否则访客拿到公开令牌即可污染长期记忆。
   - 用 `web_gateway.config.cognitive=false` 可整体关掉。
 - **不做第二份实现**：所有操作转发给 `pasm-skills` 的
-  `pasm_skills.cognition.Capabilities`（唯一实现）。MCP 与 HTTP 两个表面共用同一份逻辑，
-  避免"改了一边忘了另一边"的行为漂移 —— 本项目已因同源两份代码出过一次真实缺陷。
+  `pasm_skills.cognition.Capabilities`（HTTP / 桌面 / 脚本共用的实现）。
+  ⚠️ **诚实说明**：`pasm-mcp-server` 的 `tools.py` 目前**仍是自己那份实现**
+  （它先于基座门面存在），尚未改为委托 —— 也就是说 **MCP 与 HTTP 暂时并存两套等价逻辑**。
+  两边关键语义已逐条对齐，但在 MCP 侧完成迁移前，**改认知语义必须同时改两处**。
+  该迁移是已登记的后续项。
 - 依赖提升到 `pasm-skills>=0.6.0`。
 - `tools/e2e_cognitive_api.py`：**真起 HTTP 服务**的端到端验证（20 项，含鉴权、
   参数错、跨 agent 隔离、原有路由未被影响）。
