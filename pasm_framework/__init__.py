@@ -39,7 +39,7 @@ PASM V1→V2 升级时，**不重写 4 个产品智能体 + 3 个技能**。手�
 """
 from __future__ import annotations
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 from .adapter import (  # noqa: F401
     DomainAdapter,
@@ -331,6 +331,114 @@ def selftest() -> bool:
             _g3 = type(gw)({})                       # 无令牌 = 开发开放模式
             check(_ProbeHandler(_g3, "/console")._authorized("/console"),
                   "网关：无令牌配置时保持开放（兼容本机开发）")
+
+            # ---- ★ v0.5.3 自定义路由（应用侧扩展接口）----
+            # 这段**必须真起服务器**：曾经的缺陷正是"register_route 写好了、
+            # 却没接进 HTTP 分派"——假 server 直接调 _guard 是测不出来的。
+            # 症状极具迷惑性：服务报 healthy、管理台照样能聊，
+            # **只有应用自己注册的接口全 404，零提示**。
+            import json as _json
+            import socket as _socket
+            import urllib.error as _urlerr
+            import urllib.request as _urlreq
+
+            def _free_port() -> int:
+                _s = _socket.socket()
+                _s.bind(("127.0.0.1", 0))
+                _p = _s.getsockname()[1]
+                _s.close()
+                return _p
+
+            _port = _free_port()
+            _rt = type(gw)({"token": "ADMIN-RT", "public_token": "PUB-RT"})
+
+            def _ping(q, b):
+                return 200, {"pong": q.get("x", "")}
+
+            def _echo(q, b):
+                return 200, {"got": b}
+
+            def _bad(q, b):
+                raise ValueError("x 必须是数字")
+
+            def _crash(q, b):
+                raise RuntimeError("boom")
+
+            _rt.register_route("GET", "/api/app/ping", _ping)
+            _rt.register_route("post", "/api/app/echo", _echo)   # 小写应被归一
+            _rt.register_route("GET", "/api/app/bad", _bad)
+            _rt.register_route("GET", "/api/app/crash", _crash)
+
+            def _call(method, path, tok=None, body=None):
+                req = _urlreq.Request("http://127.0.0.1:%d%s" % (_port, path),
+                                      method=method)
+                if tok:
+                    req.add_header("Authorization", "Bearer " + tok)
+                data = None
+                if body is not None:
+                    data = _json.dumps(body).encode("utf-8")
+                    req.add_header("Content-Type", "application/json")
+                try:
+                    with _urlreq.urlopen(req, data=data, timeout=5) as r:
+                        return r.status, _json.loads(r.read().decode("utf-8") or "{}")
+                except _urlerr.HTTPError as ex:
+                    return ex.code, _json.loads(ex.read().decode("utf-8") or "{}")
+
+            try:
+                _rt.start(host="127.0.0.1", port=_port)
+                # ★ 下面这几条正是过去会静默失效的地方：注册了 → 真能打到。
+                _st, _pl = _call("GET", "/api/app/ping?x=42", "ADMIN-RT")
+                check(_st == 200 and _pl.get("pong") == "42",
+                      "★ 自定义路由真能命中且 query 透传（%s %s）" % (_st, _pl))
+                _st, _pl = _call("POST", "/api/app/echo", "ADMIN-RT", {"a": 1})
+                check(_st == 200 and _pl.get("got") == {"a": 1},
+                      "★ 自定义路由 POST 收到 JSON body（%s %s）" % (_st, _pl))
+                _st, _ = _call("GET", "/api/app/nope", "ADMIN-RT")
+                check(_st == 404, "自定义路由：未注册路径 → 404（不误吞）")
+                # ★ 鉴权不变量：自定义路由**一律管理作用域**。
+                _st, _ = _call("GET", "/api/app/ping?x=1")
+                check(_st == 401, "★ 自定义路由无令牌 → 401")
+                _st, _ = _call("GET", "/api/app/ping?x=1", "PUB-RT")
+                check(_st == 401,
+                      "★ 自定义路由拒绝公开令牌（不因\"自定义\"就降级作用域）")
+                _st, _pl = _call("GET", "/api/app/bad", "ADMIN-RT")
+                check(_st == 400 and "x 必须是数字" in str(_pl.get("error")),
+                      "自定义路由：handler 抛 ValueError → 400（调用方可纠错）")
+                _st, _pl = _call("GET", "/api/app/crash", "ADMIN-RT")
+                check(_st == 500 and "boom" in str(_pl.get("error")),
+                      "自定义路由：handler 抛其它异常 → 500（不把服务打挂）")
+                _st, _pl = _call("GET", "/healthz")
+                check(_st == 200 and _pl.get("custom_routes") == 4,
+                      "★ /healthz 暴露 custom_routes 条数（=0 就是\"没注册上\"信号）")
+            finally:
+                _rt.stop()
+
+            # 注册语义（不需要起服务器）
+            check(_rt.match_route("POST", "/api/app/echo") is not None,
+                  "match_route 对 method 大小写不敏感（注册 post → 匹配 POST）")
+            check(_rt.match_route("GET", "/api/app/none") is None,
+                  "match_route 未注册 → None")
+            _hit = _rt.match_route("GET", "/api/app/ping")
+            check(_hit is not None and _hit[1] is True,
+                  "★ 自定义路由一律管理作用域（need_admin 恒为 True）")
+            # ★ 注册到内置路径会被内置分支遮蔽 → 必须**拒绝**而不是静默接受。
+            for _rp in ("/healthz", "/api/chat", "/console",
+                        CognitiveAPI.PREFIX.rstrip("/")):
+                try:
+                    _rt.register_route("GET", _rp, _ping)
+                    check(False, "注册内置路径 %s 应被拒绝（否则静默失效）" % _rp)
+                except ValueError:
+                    check(True, "注册内置路径 %s 被拒绝（不静默失效）" % _rp)
+            try:
+                _rt.register_route("GET", "/api/app/x", "not-callable")
+                check(False, "handler 不可调用应抛 TypeError")
+            except TypeError:
+                check(True, "自定义路由：handler 不可调用抛 TypeError")
+            try:
+                _rt.register_route("GET", "no-leading-slash", _ping)
+                check(False, "path 缺前导 / 应被拒绝")
+            except ValueError:
+                check(True, "自定义路由：path 缺前导 / 被拒绝")
 
             # ---- 认知 HTTP API（/api/cog/*）
             check(getattr(gw, "cognitive", None) is not None

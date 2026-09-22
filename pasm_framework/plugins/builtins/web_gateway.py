@@ -72,7 +72,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from ..core import BasePlugin, PluginContext
 from ._web_assets import CONSOLE_HTML, EMBED_JS
@@ -97,6 +97,18 @@ _WIDGET_PATHS = ("/", "/widget", "/index.html")
 #: ``ingest_text`` 把长文切成多长的块（字符）。太大 → 检索命中后回复里塞满无关内容；
 #: 太小 → 一句话被切断、语义破碎。800 字符约合中文 2–4 段，是"能独立成条"的量级。
 _CHUNK_CHARS = 800
+
+#: 内置路由占用的路径。**自定义路由注册到这些路径上会被内置分支遮蔽**
+#: （``do_GET``/``do_POST`` 里内置分支在前、``_custom`` 在最后），
+#: 表现为"注册成功但请求仍走内置逻辑 / 仍 404"，且**零提示**。
+#: 所以 :meth:`WebGatewayPlugin.register_route` 直接拒绝 —— 宁可启动即报错，
+#: 也不要"注册了却零生效"。``/api/cog/*`` 前缀同理，归认知接口独占。
+_RESERVED_PATHS = frozenset((
+    "/", "/widget", "/index.html", "/embed.js", "/console", "/healthz",
+    "/api/chat", "/api/chat/stream", "/api/ingest", "/api/ingest/text",
+    "/api/plugins", "/api/summary", "/api/kb/stats", "/api/sessions",
+    "/api/sessions/reset",
+))
 
 #: 短于此长度的段落视为"碎片"（小标题、单句），会被并入相邻段而不是独立成条 ——
 #: 一个只有标题的块既是噪声、又几乎匹配不到任何问句。
@@ -455,6 +467,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, gw.sessions_info())
         elif _COG_PREFIX.rstrip("/") in path or path.startswith(_COG_PREFIX):
             self._cog("GET")
+        elif self._custom("GET"):
+            pass
         else:
             self._send(404, {"error": "not found", "paths": [
                 "/", "/widget", "/embed.js", "/console", "/healthz",
@@ -551,6 +565,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": gw.reset_session(sid), "session_id": sid})
         elif _COG_PREFIX.rstrip("/") in path or path.startswith(_COG_PREFIX):
             self._cog("POST")
+        elif self._custom("POST"):
+            pass
         else:
             self._send(404, {"error": "not found"})
 
@@ -581,12 +597,50 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(out[0], out[1])
 
+    # ---- 自定义路由分派 --------------------------------------------
+
+    def _custom(self, method: str) -> bool:
+        """尝试用应用注册的自定义路由处理；返回 True 表示已处理（含已回错误）。
+
+        ★ 鉴权在这里做，而且 **admin 恒为 True**：自定义路由能写数据，
+        绝不能因为"是应用自己注册的"就降级成公开作用域。
+        """
+        path = self.path.split("?")[0]
+        hit = self._gw.match_route(method, path)
+        if hit is None:
+            return False
+        handler, need_admin = hit
+        # ★ 这里是**第二道**守卫（第一道在 do_GET/do_POST 的入口处）。刻意冗余：
+        #   入口那道是所有路径共用的，一旦将来有人在它之前插入新分支，这道就是兜底。
+        #   反例对照实测过：单独破坏任一道，selftest 仍全绿（另一道拦住了）；
+        #   必须**同时**破坏两道才会变红。所以 selftest 断言的是**结果**
+        #   （公开令牌打自定义路由必须 401），而不是"某一行代码生效"。
+        #   —— 别把它当死代码删掉。
+        if not self._guard(path, admin=need_admin):
+            return True
+        _, _, query = self.path.partition("?")
+        body: Dict[str, Any] = {}
+        if method == "POST":
+            got = self._read_json()
+            if got is None:
+                return True
+            body = got
+        q = {k: v[-1] for k, v in parse_qs(query or "").items() if v}
+        try:
+            status, payload = handler(q, body)
+        except ValueError as ex:                  # 参数错 → 400（调用方可自行纠错）
+            status, payload = 400, {"error": str(ex)}
+        except Exception as ex:                   # noqa: BLE001
+            status, payload = 500, {"error": "%s: %s" % (type(ex).__name__, ex)}
+        self._send(status, payload)
+        return True
+
 
 class WebGatewayPlugin(BasePlugin):
     """零依赖 HTTP 网关。"""
 
     name = "web_gateway"
-    version = "0.3.0"
+    version = "0.3.1"
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(config)
@@ -610,6 +664,56 @@ class WebGatewayPlugin(BasePlugin):
         self._app: Optional[Any] = None
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        #: 自定义路由：{(METHOD, path): handler(query: dict, body: dict) -> (status, payload)}
+        self._routes: Dict[tuple, Any] = {}
+
+    # ---- 自定义路由 ----
+
+    def register_route(self, method: str, path: str, handler: Any) -> None:
+        """注册一条自定义路由（应用侧扩展接口用）。
+
+        ``handler(query: dict, body: dict) -> (status:int, payload:dict)``
+
+        为什么用运行时注册而不是配置项：handler 是**可调用对象**，
+        塞进 JSON 配置既不好序列化也不好测试。运行时注册最直接。
+
+        ★ 这些路由与内置路由**共用同一套鉴权与限流** —— 别指望靠"自定义"绕开
+        管理作用域；那正是最容易出越权的地方。
+        """
+        if not callable(handler):
+            raise TypeError("handler 必须可调用")
+        p = str(path or "").strip()
+        if not p.startswith("/"):
+            raise ValueError("自定义路由 path 必须以 / 开头：%r" % (path,))
+        if p in _RESERVED_PATHS or p == _COG_PREFIX.rstrip("/") \
+                or p.startswith(_COG_PREFIX):
+            raise ValueError(
+                "自定义路由不能注册到内置路径 %r —— 内置分支在前会把它遮蔽掉，"
+                "表现为\"注册成功但请求仍走内置逻辑 / 仍 404\"且零提示。"
+                "请换前缀，例如 /api/app/<你的接口>" % p)
+        self._routes[(method.upper(), p)] = handler
+
+    def match_route(self, method: str, path: str):
+        """找一条自定义路由，返回 ``(handler, need_admin)`` 或 ``None``。
+
+        自定义路由**一律管理作用域**（``need_admin=True``）——认知与医疗类接口
+        都能写数据，不能像 ``/api/chat`` 那样对访客开放。
+        """
+        h = self._routes.get((method.upper(), path))
+        return (h, True) if h else None
+
+    def routes_info(self) -> Dict[str, Any]:
+        """已注册的自定义路由概览（**只暴露方法与路径，不暴露 handler**）。
+
+        存在的意义：``register_route`` 曾经因为"没接进 HTTP 分派"而**静默失效** ——
+        服务照样报 healthy、管理台照样能聊，只有应用自己的接口全 404，零提示。
+        现在把条数挂到 ``/healthz`` 上，部署后一眼能看出
+        "应用该注册的路由到底有没有注册上"（``custom_routes: 0`` 就是信号）。
+        """
+        return {
+            "count": len(self._routes),
+            "routes": sorted("%s %s" % (m, p) for (m, p) in self._routes),
+        }
 
     @property
     def serve_token(self) -> str:
@@ -753,6 +857,9 @@ class WebGatewayPlugin(BasePlugin):
             "host": self._host,
             "port": self._port,
             "auth_required": bool(self.token),
+            # 应用侧注册的自定义路由条数。**该是 0 还是非 0，部署方一眼可辨** ——
+            # 见 routes_info() 的注释：这类"注册了却没生效"过去是完全静默的。
+            "custom_routes": len(self._routes),
         }
         pm = getattr(self._app, "plugins", None) if self._app is not None else None
         obs = pm.get("observability") if pm is not None else None
